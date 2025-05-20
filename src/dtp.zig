@@ -57,7 +57,48 @@ test "decode message size" {
 }
 
 test "crypto" {
-    // TODO
+    const public_key = crypto.newKeyPair().public_key;
+    const secret_key1 = crypto.newKeyPair().secret_key;
+    const secret_key2 = crypto.newKeyPair().secret_key;
+    const intermediate_shared_key1 = try crypto.dh1(public_key, secret_key2);
+    const intermediate_shared_key2 = try crypto.dh1(public_key, secret_key1);
+    const shared_key1 = try crypto.dh2(intermediate_shared_key1, secret_key1);
+    const shared_key2 = try crypto.dh2(intermediate_shared_key2, secret_key2);
+    std.debug.print("Public key:                      {s}\n", .{public_key});
+    std.debug.print("Alice's secret key:              {s}\n", .{secret_key1});
+    std.debug.print("Bob's secret key:                {s}\n", .{secret_key2});
+    std.debug.print("Alice's intermediate shared key: {s}\n", .{intermediate_shared_key1});
+    std.debug.print("Bob's intermediate shared key:   {s}\n", .{intermediate_shared_key2});
+    std.debug.print("Alice's final shared key:        {s}\n", .{shared_key1});
+    std.debug.print("Bob's final shared key:          {s}\n", .{shared_key2});
+    try testing.expect(!std.meta.eql(secret_key1, secret_key2));
+    try testing.expect(!std.meta.eql(intermediate_shared_key1, intermediate_shared_key2));
+    try testing.expectEqual(shared_key1, shared_key2);
+
+    const aes_message = "Hello, AES!";
+    var aes_encrypted1 = std.ArrayList(u8).init(testing.allocator);
+    defer aes_encrypted1.deinit();
+    try crypto.aesEncrypt(shared_key1, aes_message, aes_encrypted1.writer());
+    var aes_decrypted1 = std.ArrayList(u8).init(testing.allocator);
+    defer aes_decrypted1.deinit();
+    try crypto.aesDecrypt(shared_key1, aes_encrypted1.items, aes_decrypted1.writer());
+    std.debug.print("Original string:          '{s}'\n", .{aes_message});
+    std.debug.print("Alice's encrypted string: '{s}'\n", .{aes_encrypted1.items});
+    std.debug.print("Alice's decrypted string: '{s}'\n", .{aes_decrypted1.items});
+    try testing.expectEqualStrings(aes_decrypted1.items, aes_message);
+    try testing.expect(!std.mem.eql(u8, aes_encrypted1.items, aes_message));
+    var aes_encrypted2 = std.ArrayList(u8).init(testing.allocator);
+    defer aes_encrypted2.deinit();
+    try crypto.aesEncrypt(shared_key2, aes_message, aes_encrypted2.writer());
+    var aes_decrypted2 = std.ArrayList(u8).init(testing.allocator);
+    defer aes_decrypted2.deinit();
+    try crypto.aesDecrypt(shared_key2, aes_encrypted2.items, aes_decrypted2.writer());
+    std.debug.print("Original string:          '{s}'\n", .{aes_message});
+    std.debug.print("Bob's encrypted string:   '{s}'\n", .{aes_encrypted2.items});
+    std.debug.print("Bob's decrypted string:   '{s}'\n", .{aes_decrypted2.items});
+    try testing.expectEqualStrings(aes_decrypted2.items, aes_message);
+    try testing.expect(!std.mem.eql(u8, aes_encrypted2.items, aes_message));
+    try testing.expectEqualStrings(aes_decrypted1.items, aes_decrypted2.items);
 }
 
 test "server serving" {
