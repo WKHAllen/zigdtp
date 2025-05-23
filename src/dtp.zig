@@ -1,12 +1,16 @@
 const std = @import("std");
 
-const client = @import("client.zig");
-const server = @import("server.zig");
+const client_impl = @import("client.zig");
+const server_impl = @import("server.zig");
 const crypto = @import("crypto.zig");
 const util = @import("util.zig");
+const err = @import("err.zig");
 
-pub const Client = client.Client;
-pub const Server = server.Server;
+pub const Client = client_impl.Client;
+pub const ClientOptions = client_impl.ClientOptions;
+pub const Server = server_impl.Server;
+pub const ServerOptions = server_impl.ServerOptions;
+pub const Error = err.Error;
 
 const testing = std.testing;
 

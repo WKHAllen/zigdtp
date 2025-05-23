@@ -4,12 +4,12 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const X25519 = std.crypto.dh.X25519;
 const KeyPair = X25519.KeyPair;
-const public_length = X25519.public_length;
-const secret_length = X25519.secret_length;
-const shared_length = X25519.shared_length;
+pub const public_length = X25519.public_length;
+pub const secret_length = X25519.secret_length;
+pub const shared_length = X25519.shared_length;
 
 const Aes256 = std.crypto.core.aes.Aes256;
-const key_length = Aes256.key_bits / 8;
+pub const key_length = Aes256.key_bits / 8;
 
 fn sha256(bytes: []const u8) [Sha256.digest_length]u8 {
     var hasher = Sha256.init(.{});
@@ -25,7 +25,7 @@ pub fn dh1(public_key: [public_length]u8, secret_key: [secret_length]u8) ![share
     return try X25519.scalarmult(secret_key, public_key);
 }
 
-pub fn dh2(intermediate_shared_key: [shared_length]u8, secret_key: [shared_length]u8) ![shared_length]u8 {
+pub fn dh2(intermediate_shared_key: [shared_length]u8, secret_key: [secret_length]u8) ![shared_length]u8 {
     const shared_key = try X25519.scalarmult(secret_key, intermediate_shared_key);
     return sha256(&shared_key);
 }
