@@ -13,6 +13,126 @@ pub const ServerOptions = server_impl.ServerOptions;
 pub const Error = err.Error;
 
 const testing = std.testing;
+const Allocator = std.mem.Allocator;
+const Thread = std.Thread;
+const Mutex = Thread.Mutex;
+
+const SERVER_HOST = "127.0.0.1";
+const SERVER_PORT = 0;
+const SLEEP_TIME = 100_000_000;
+
+fn sleep() void {
+    Thread.sleep(SLEEP_TIME);
+}
+
+const ExpectMap = struct {
+    const Self = @This();
+
+    pub const ExpectType = enum {
+        server_receive,
+        server_connect,
+        server_disconnect,
+        client_receive,
+        client_disconnected,
+
+        pub fn format(self: ExpectType, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+            try writer.writeAll(switch (self) {
+                .server_receive => ".server_receive",
+                .server_connect => ".server_connect",
+                .server_disconnect => ".server_disconnect",
+                .client_receive => ".client_receive",
+                .client_disconnected => ".client_disconnected",
+            });
+        }
+    };
+
+    expected: std.AutoHashMap(ExpectType, usize),
+    observed: std.AutoHashMap(ExpectType, usize),
+    mutex: Mutex,
+
+    pub fn init(allocator: Allocator) Self {
+        return Self{
+            .expected = std.AutoHashMap(ExpectType, usize).init(allocator),
+            .observed = std.AutoHashMap(ExpectType, usize).init(allocator),
+            .mutex = Mutex{},
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.expected.deinit();
+        self.observed.deinit();
+    }
+
+    pub fn expect(self: *Self, kind: ExpectType, count: usize) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        try self.expected.put(kind, count);
+        try self.observed.put(kind, 0);
+    }
+
+    pub fn received(self: *Self, kind: ExpectType) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.observed.getPtr(kind)) |count| {
+            count.* += 1;
+        } else {
+            try self.observed.put(kind, 1);
+        }
+    }
+
+    pub fn done(self: *Self) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var iter = self.expected.keyIterator();
+
+        while (iter.next()) |kind| {
+            const expected = self.expected.get(kind.*).?;
+            const observed = self.observed.get(kind.*).?;
+
+            if (expected != observed) {
+                std.debug.print("\"{s}\" expected {d}, got {d}\n", .{ kind, expected, observed });
+            }
+
+            try testing.expectEqual(expected, observed);
+        }
+    }
+};
+
+fn OnReceive(comptime S: type, comptime R: type) fn (*ExpectMap, *Server(S, R, *ExpectMap), usize, R) void {
+    return struct {
+        fn onReceive(expected: *ExpectMap, _: *Server(S, R, *ExpectMap), _: usize, _: R) void {
+            expected.received(.server_receive) catch |e| {
+                std.debug.panic("{any}\n", .{e});
+            };
+        }
+    }.onReceive;
+}
+
+fn OnConnect(comptime S: type, comptime R: type) fn (*ExpectMap, *Server(S, R, *ExpectMap), usize) void {
+    return struct {
+        fn onConnect(expected: *ExpectMap, _: *Server(S, R, *ExpectMap), _: usize) void {
+            expected.received(.server_connect) catch |e| {
+                std.debug.panic("{any}\n", .{e});
+            };
+        }
+    }.onConnect;
+}
+
+fn OnDisconnect(comptime S: type, comptime R: type) fn (*ExpectMap, *Server(S, R, *ExpectMap), usize) void {
+    return struct {
+        fn onDisonnect(expected: *ExpectMap, _: *Server(S, R, *ExpectMap), _: usize) void {
+            expected.received(.server_disconnect) catch |e| {
+                std.debug.panic("{any}\n", .{e});
+            };
+        }
+    }.onDisonnect;
+}
 
 test "serialize and deserialize" {
     const Foo = struct {
@@ -106,7 +226,31 @@ test "crypto" {
 }
 
 test "server serving" {
-    // TODO
+    var expected = ExpectMap.init(testing.allocator);
+    defer expected.deinit();
+    try expected.expect(.server_receive, 0);
+    try expected.expect(.server_connect, 0);
+    try expected.expect(.server_disconnect, 0);
+
+    var server = Server(i32, []const u8, *ExpectMap).init(testing.allocator, &expected, .{
+        .on_receive = OnReceive(i32, []const u8),
+        .on_connect = OnConnect(i32, []const u8),
+        .on_disconnect = OnDisconnect(i32, []const u8),
+    });
+    try testing.expect(!server.serving());
+    try server.start(SERVER_HOST, SERVER_PORT);
+    sleep();
+
+    try testing.expect(server.serving());
+    const addr = try server.getAddress();
+    std.debug.print("Server address: {}\n", .{addr});
+
+    try server.stop();
+    sleep();
+
+    try testing.expect(!server.serving());
+
+    try expected.done();
 }
 
 test "addresses" {

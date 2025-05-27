@@ -49,6 +49,7 @@ pub fn Client(comptime S: type, comptime R: type, comptime C: type) type {
         pub fn init(allocator: Allocator, ctx: C, options: ClientOptions(S, R, C)) Self {
             return Self{
                 .state = .not_connected,
+                .handle_thread = null,
                 .handle_error = null,
                 .ctx = ctx,
                 .options = options,
@@ -138,19 +139,21 @@ pub fn Client(comptime S: type, comptime R: type, comptime C: type) type {
             const secret_key = crypto.newKeyPair().secret_key;
 
             var public_key: [crypto.public_length]u8 = undefined;
-            try sock.readAll(&public_key);
+            const n1 = try sock.readAll(&public_key);
+            if (n1 != public_key.len) return Error.KeyExchangeFailed;
 
             const this_intermediate_shared_key = try crypto.dh1(public_key, secret_key);
             try sock.writeAll(&this_intermediate_shared_key);
 
             var other_intermediate_shared_key: [crypto.shared_length]u8 = undefined;
-            try sock.readAll(&other_intermediate_shared_key);
+            const n2 = try sock.readAll(&other_intermediate_shared_key);
+            if (n2 != other_intermediate_shared_key.len) return Error.KeyExchangeFailed;
 
             const shared_key = try crypto.dh2(other_intermediate_shared_key, secret_key);
 
             self.state = .{ .connected = .{ .key = shared_key, .sock = sock } };
 
-            self.handle_thread = try Thread.spawn(.{}, self.runHandle, .{});
+            self.handle_thread = try Thread.spawn(.{}, runHandle, .{self});
         }
 
         fn runHandle(self: *Self) void {
@@ -182,12 +185,14 @@ pub fn Client(comptime S: type, comptime R: type, comptime C: type) type {
 
         fn handleMessage(self: *Self, state: ClientStateInner) Error!bool {
             var size_buffer: [util.LENSIZE]u8 = undefined;
-            state.sock.readAll(&size_buffer) catch return false;
+            const n1 = state.sock.readAll(&size_buffer) catch return false;
+            if (n1 != size_buffer.len) return false;
             const message_size = util.decodeMessageSize(size_buffer);
 
             var data_encrypted = try std.ArrayList(u8).initCapacity(self.allocator, message_size);
             defer data_encrypted.deinit();
-            state.sock.readAll(data_encrypted.items) catch return false;
+            const n2 = state.sock.readAll(data_encrypted.items) catch return false;
+            if (n2 != size_buffer.len) return false;
 
             var data_serialized = std.ArrayList(u8).init(self.allocator);
             defer data_serialized.deinit();

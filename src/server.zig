@@ -6,6 +6,7 @@ const Allocator = std.mem.Allocator;
 const net = std.net;
 const Stream = net.Stream;
 const Listener = net.Server;
+const AcceptError = Listener.AcceptError;
 const Connection = Listener.Connection;
 const Address = net.Address;
 const Thread = std.Thread;
@@ -50,6 +51,22 @@ fn callOnDisconnectInner(comptime S: type, comptime R: type, comptime C: type, o
     on_disconnect(ctx, server, client_id);
 }
 
+/// TODO: remove this once [this PR](https://github.com/ziglang/zig/pull/22555)
+/// is included in a major release.
+fn resolveIp(name: []const u8, port: u16) !Address {
+    if (Address.parseIp4(name, port)) |ip4| return ip4 else |err| switch (err) {
+        error.Overflow,
+        error.InvalidEnd,
+        error.InvalidCharacter,
+        error.Incomplete,
+        error.NonCanonical,
+        => {},
+        else => return err,
+    }
+
+    return error.InvalidIPAddressFormat;
+}
+
 pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
     return struct {
         const Self = @This();
@@ -64,6 +81,7 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
         pub fn init(allocator: Allocator, ctx: C, options: ServerOptions(S, R, C)) Self {
             return Self{
                 .state = .not_serving,
+                .serve_thread = null,
                 .serve_error = null,
                 .ctx = ctx,
                 .options = options,
@@ -82,7 +100,7 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
                 return Error.AlreadyServing;
             }
 
-            const address = try Address.resolveIp(host, port);
+            const address = try resolveIp(host, port);
             try self.startViaAddress(address);
         }
 
@@ -91,17 +109,17 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
                 return Error.AlreadyServing;
             }
 
-            const listener = try address.listen(.{ .reuse_address = true, .reuse_port = true });
+            const listener = try address.listen(.{ .reuse_address = true, .reuse_port = true, .force_nonblocking = true });
 
             self.state = .{ .serving = .{ .sock = listener, .clients = std.AutoHashMap(usize, ClientRepr).init(self.allocator), .next_client_id = 0 } };
 
-            self.serve_thread = try Thread.spawn(.{}, self.runServe, .{});
+            self.serve_thread = try Thread.spawn(.{}, runServe, .{self});
         }
 
         pub fn stop(self: *Self) Error!void {
             switch (self.state) {
                 .not_serving => return Error.NotServing,
-                .serving => |state| {
+                .serving => |*state| {
                     var iter = state.clients.valueIterator();
 
                     while (iter.next()) |client| {
@@ -232,12 +250,13 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
             try sock.writeAll(&this_intermediate_shared_key);
 
             var other_intermediate_shared_key: [crypto.shared_length]u8 = undefined;
-            try sock.readAll(&other_intermediate_shared_key);
+            const n = try sock.readAll(&other_intermediate_shared_key);
+            if (n != other_intermediate_shared_key.len) return Error.KeyExchangeFailed;
 
             const shared_key = try crypto.dh2(other_intermediate_shared_key, secret_key);
 
             switch (self.state) {
-                .serving => |state| {
+                .serving => |*state| {
                     const client_id = state.next_client_id;
                     state.next_client_id += 1;
 
@@ -248,8 +267,9 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
                         .serve_client_thread = null,
                     });
 
-                    state.clients.getPtr(client_id).?.serve_client_thread = try Thread.spawn(.{}, self.serveClient, .{client_id});
+                    state.clients.getPtr(client_id).?.serve_client_thread = try Thread.spawn(.{}, serveClient, .{ self, client_id });
                 },
+                .not_serving => {},
             }
         }
 
@@ -263,11 +283,22 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
             while (true) {
                 switch (self.state) {
                     .not_serving => break,
-                    .serving => |state| {
-                        const conn = state.sock.accept() catch break;
+                    .serving => |*state| {
+                        const conn = state.sock.accept() catch |err| {
+                            switch (err) {
+                                AcceptError.WouldBlock => {
+                                    Thread.sleep(util.SLEEP_TIME);
+                                    continue;
+                                },
+                                else => break,
+                            }
+                        };
+
                         try self.exchangeKeys(conn.stream, conn.address);
                     },
                 }
+
+                Thread.sleep(util.SLEEP_TIME);
             }
         }
 
@@ -278,7 +309,7 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
                 switch (self.state) {
                     .not_serving => break,
                     .serving => |state| if (state.clients.get(client_id)) |client| {
-                        const should_continue = try self.handleClientMessage(client);
+                        const should_continue = try self.handleClientMessage(client_id, client);
                         if (!should_continue) break;
                     } else break,
                 }
@@ -287,21 +318,23 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
             try self.callOnDisconnect(client_id);
         }
 
-        fn handleClientMessage(self: *Self, client: ClientRepr) Error!bool {
+        fn handleClientMessage(self: *Self, client_id: usize, client: ClientRepr) Error!bool {
             var size_buffer: [util.LENSIZE]u8 = undefined;
-            client.sock.readAll(&size_buffer) catch return false;
+            const n1 = client.sock.readAll(&size_buffer) catch return false;
+            if (n1 != size_buffer.len) return false;
             const message_size = util.decodeMessageSize(size_buffer);
 
             var data_encrypted = try std.ArrayList(u8).initCapacity(self.allocator, message_size);
             defer data_encrypted.deinit();
-            client.sock.readAll(data_encrypted.items) catch return false;
+            const n2 = client.sock.readAll(data_encrypted.items) catch return false;
+            if (n2 != data_encrypted.items.len) return false;
 
             var data_serialized = std.ArrayList(u8).init(self.allocator);
             defer data_serialized.deinit();
-            crypto.aesDecrypt(client.key, data_encrypted.items, data_serialized.writer());
+            try crypto.aesDecrypt(client.key, data_encrypted.items, data_serialized.writer());
 
-            const data_parsed = try util.deserialize(R, data_serialized, self.allocator);
-            try self.callOnReceive(data_parsed);
+            const data_parsed = try util.deserialize(R, data_serialized.items, self.allocator);
+            try self.callOnReceive(client_id, data_parsed);
 
             return true;
         }

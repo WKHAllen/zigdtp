@@ -3,6 +3,8 @@ const Allocator = std.mem.Allocator;
 
 pub const LENSIZE = 5;
 
+pub const SLEEP_TIME = 1_000_000;
+
 pub fn serialize(data: anytype, out_stream: anytype) !void {
     try std.json.stringify(data, .{}, out_stream);
 }
