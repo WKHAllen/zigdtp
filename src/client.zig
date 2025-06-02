@@ -5,6 +5,7 @@ const Error = @import("err.zig").Error;
 const Allocator = std.mem.Allocator;
 const net = std.net;
 const Stream = net.Stream;
+const ReadError = std.posix.ReadError;
 const Address = net.Address;
 const Thread = std.Thread;
 const Parsed = std.json.Parsed;
@@ -21,14 +22,13 @@ const ClientState = union(enum) {
 
 pub fn ClientOptions(comptime S: type, comptime R: type, comptime C: type) type {
     return struct {
-        on_receive: ?*const fn (C, *Client(S, R, C), R) void = null,
+        on_receive: ?*const fn (C, *Client(S, R, C), Parsed(R)) void = null,
         on_disconnected: ?*const fn (C, *Client(S, R, C)) void = null,
     };
 }
 
-fn callOnReceiveInner(comptime S: type, comptime R: type, comptime C: type, on_receive: *const fn (C, *Client(S, R, C), R) void, ctx: C, client: *Client(S, R, C), data_parsed: Parsed(R)) void {
-    on_receive(ctx, client, data_parsed.value);
-    data_parsed.deinit();
+fn callOnReceiveInner(comptime S: type, comptime R: type, comptime C: type, on_receive: *const fn (C, *Client(S, R, C), Parsed(R)) void, ctx: C, client: *Client(S, R, C), data: Parsed(R)) void {
+    on_receive(ctx, client, data);
 }
 
 fn callOnDisconnectedInner(comptime S: type, comptime R: type, comptime C: type, on_disconnected: *const fn (C, *Client(S, R, C)) void, ctx: C, client: *Client(S, R, C)) void {
@@ -61,6 +61,8 @@ pub fn Client(comptime S: type, comptime R: type, comptime C: type) type {
             if (self.connected()) {
                 self.disconnect() catch {};
             }
+
+            self.* = undefined;
         }
 
         pub fn connect(self: *Self, host: []const u8, port: u16) Error!void {
@@ -69,7 +71,7 @@ pub fn Client(comptime S: type, comptime R: type, comptime C: type) type {
             }
 
             const stream = try net.tcpConnectToHost(self.allocator, host, port);
-            self.exchangeKeys(stream);
+            try self.exchangeKeys(stream);
         }
 
         pub fn connectViaAddress(self: *Self, address: Address) Error!void {
@@ -77,16 +79,16 @@ pub fn Client(comptime S: type, comptime R: type, comptime C: type) type {
                 return Error.AlreadyConnected;
             }
 
-            const stream = try net.tcpConnectToAddress(self.allocator, address);
-            self.exchangeKeys(stream);
+            const stream = try net.tcpConnectToAddress(address);
+            try self.exchangeKeys(stream);
         }
 
         pub fn disconnect(self: *Self) Error!void {
             switch (self.state) {
                 .not_connected => return Error.NotConnected,
                 .connected => |state| {
-                    state.sock.close();
                     self.state = .not_connected;
+                    state.sock.close();
 
                     if (self.handle_thread) |handle_thread| handle_thread.join();
 
@@ -108,8 +110,11 @@ pub fn Client(comptime S: type, comptime R: type, comptime C: type) type {
                     try crypto.aesEncrypt(state.key, data_serialized.items, data_encrypted.writer());
 
                     const encoded_size = util.encodeMessageSize(data_encrypted.items.len);
-                    try state.sock.writeAll(&encoded_size);
-                    try state.sock.writeAll(data_encrypted.items);
+                    var message = try std.ArrayList(u8).initCapacity(self.allocator, data_encrypted.items.len + util.LENSIZE);
+                    defer message.deinit();
+                    try message.appendSlice(&encoded_size);
+                    try message.appendSlice(data_encrypted.items);
+                    try state.sock.writeAll(message.items);
                 },
             }
         }
@@ -121,9 +126,9 @@ pub fn Client(comptime S: type, comptime R: type, comptime C: type) type {
             };
         }
 
-        fn callOnReceive(self: *Self, data_parsed: Parsed(R)) Thread.SpawnError!void {
+        fn callOnReceive(self: *Self, data: Parsed(R)) Thread.SpawnError!void {
             if (self.options.on_receive) |on_receive| {
-                const thread = try Thread.spawn(.{}, callOnReceiveInner, .{ S, R, C, on_receive, self.ctx, self, data_parsed });
+                const thread = try Thread.spawn(.{}, callOnReceiveInner, .{ S, R, C, on_receive, self.ctx, self, data });
                 thread.detach();
             }
         }
@@ -136,6 +141,8 @@ pub fn Client(comptime S: type, comptime R: type, comptime C: type) type {
         }
 
         fn exchangeKeys(self: *Self, sock: Stream) Error!void {
+            try util.setBlocking(sock, true);
+
             const secret_key = crypto.newKeyPair().secret_key;
 
             var public_key: [crypto.public_length]u8 = undefined;
@@ -151,6 +158,8 @@ pub fn Client(comptime S: type, comptime R: type, comptime C: type) type {
 
             const shared_key = try crypto.dh2(other_intermediate_shared_key, secret_key);
 
+            try util.setBlocking(sock, false);
+
             self.state = .{ .connected = .{ .key = shared_key, .sock = sock } };
 
             self.handle_thread = try Thread.spawn(.{}, runHandle, .{self});
@@ -163,43 +172,52 @@ pub fn Client(comptime S: type, comptime R: type, comptime C: type) type {
         }
 
         fn handle(self: *Self) Error!void {
-            while (true) {
+            const disconnected = while (true) {
                 switch (self.state) {
-                    .not_connected => break,
+                    .not_connected => break false,
                     .connected => |state| {
                         const should_continue = try self.handleMessage(state);
-                        if (!should_continue) break;
+                        if (!should_continue) break true;
                     },
                 }
-            }
+
+                Thread.sleep(util.SLEEP_TIME);
+            };
 
             switch (self.state) {
+                .not_connected => {},
                 .connected => |state| {
                     state.sock.close();
                     self.state = .not_connected;
                 },
             }
 
-            try self.callOnDisconnected();
+            if (disconnected) try self.callOnDisconnected();
         }
 
         fn handleMessage(self: *Self, state: ClientStateInner) Error!bool {
             var size_buffer: [util.LENSIZE]u8 = undefined;
-            const n1 = state.sock.readAll(&size_buffer) catch return false;
+            const n1 = state.sock.readAll(&size_buffer) catch |err| {
+                return switch (err) {
+                    ReadError.WouldBlock => true,
+                    else => false,
+                };
+            };
             if (n1 != size_buffer.len) return false;
             const message_size = util.decodeMessageSize(size_buffer);
 
             var data_encrypted = try std.ArrayList(u8).initCapacity(self.allocator, message_size);
             defer data_encrypted.deinit();
+            data_encrypted.expandToCapacity();
             const n2 = state.sock.readAll(data_encrypted.items) catch return false;
-            if (n2 != size_buffer.len) return false;
+            if (n2 != data_encrypted.items.len) return false;
 
             var data_serialized = std.ArrayList(u8).init(self.allocator);
             defer data_serialized.deinit();
-            crypto.aesDecrypt(state.key, data_encrypted.items, data_serialized.writer());
+            try crypto.aesDecrypt(state.key, data_encrypted.items, data_serialized.writer());
 
-            const data_parsed = try util.deserialize(R, data_serialized, self.allocator);
-            try self.callOnReceive(data_parsed);
+            const data = try util.deserialize(R, data_serialized.items, self.allocator);
+            try self.callOnReceive(data);
 
             return true;
         }

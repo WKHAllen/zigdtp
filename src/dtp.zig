@@ -13,9 +13,12 @@ pub const ServerOptions = server_impl.ServerOptions;
 pub const Error = err.Error;
 
 const testing = std.testing;
+const ArrayList = std.ArrayList;
 const Allocator = std.mem.Allocator;
+const ThreadSafeAllocator = std.heap.ThreadSafeAllocator;
 const Thread = std.Thread;
 const Mutex = Thread.Mutex;
+const Parsed = std.json.Parsed;
 
 const SERVER_HOST = "127.0.0.1";
 const SERVER_PORT = 0;
@@ -25,113 +28,269 @@ fn sleep() void {
     Thread.sleep(SLEEP_TIME);
 }
 
-const ExpectMap = struct {
-    const Self = @This();
-
-    pub const ExpectType = enum {
-        server_receive,
-        server_connect,
-        server_disconnect,
-        client_receive,
-        client_disconnected,
-
-        pub fn format(self: ExpectType, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
-            try writer.writeAll(switch (self) {
-                .server_receive => ".server_receive",
-                .server_connect => ".server_connect",
-                .server_disconnect => ".server_disconnect",
-                .client_receive => ".client_receive",
-                .client_disconnected => ".client_disconnected",
-            });
-        }
+fn threadSafeAllocator() ThreadSafeAllocator {
+    return ThreadSafeAllocator{
+        .child_allocator = testing.allocator,
     };
+}
 
-    expected: std.AutoHashMap(ExpectType, usize),
-    observed: std.AutoHashMap(ExpectType, usize),
-    mutex: Mutex,
+fn eqlInner(comptime T: type, a: T, b: T) bool {
+    switch (@typeInfo(T)) {
+        .noreturn,
+        .@"opaque",
+        .frame,
+        .@"anyframe",
+        => @compileError("unable to compare values of type " ++ @typeName(T)),
 
-    pub fn init(allocator: Allocator) Self {
-        return Self{
-            .expected = std.AutoHashMap(ExpectType, usize).init(allocator),
-            .observed = std.AutoHashMap(ExpectType, usize).init(allocator),
-            .mutex = Mutex{},
-        };
-    }
+        .undefined,
+        .null,
+        .void,
+        => return true,
 
-    pub fn deinit(self: *Self) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        .bool,
+        .int,
+        .float,
+        .comptime_int,
+        .comptime_float,
+        .enum_literal,
+        .@"enum",
+        .@"fn",
+        .error_set,
+        .type,
+        => return a == b,
 
-        self.expected.deinit();
-        self.observed.deinit();
-    }
+        .pointer => |ptr| {
+            switch (ptr.size) {
+                .c, .many => return a == b,
+                .one => {
+                    switch (@typeInfo(ptr.child)) {
+                        .@"fn", .@"opaque" => return a == b,
+                        else => return eql(a.*, b.*),
+                    }
+                },
+                .slice => {
+                    if (a.len != b.len) return false;
 
-    pub fn expect(self: *Self, kind: ExpectType, count: usize) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+                    var i: usize = 0;
+                    while (i < a.len) : (i += 1) {
+                        if (!eql(a[i], b[i])) return false;
+                    }
 
-        try self.expected.put(kind, count);
-        try self.observed.put(kind, 0);
-    }
+                    return true;
+                },
+            }
+        },
 
-    pub fn received(self: *Self, kind: ExpectType) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        .array => |_| {
+            if (a.len != b.len) return false;
 
-        if (self.observed.getPtr(kind)) |count| {
-            count.* += 1;
-        } else {
-            try self.observed.put(kind, 1);
-        }
-    }
-
-    pub fn done(self: *Self) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        var iter = self.expected.keyIterator();
-
-        while (iter.next()) |kind| {
-            const expected = self.expected.get(kind.*).?;
-            const observed = self.observed.get(kind.*).?;
-
-            if (expected != observed) {
-                std.debug.print("\"{s}\" expected {d}, got {d}\n", .{ kind, expected, observed });
+            var i: usize = 0;
+            while (i < a.len) : (i += 1) {
+                if (!eql(a[i], b[i])) return false;
             }
 
-            try testing.expectEqual(expected, observed);
-        }
+            return true;
+        },
+
+        .vector => |vec| {
+            if (vec.len != @typeInfo(T).vector.len) return false;
+
+            var i: usize = 0;
+            while (i < vec.len) : (i += 1) {
+                if (!eql(a[i], b[i])) return false;
+            }
+
+            return true;
+        },
+
+        .@"struct" => |struct_info| {
+            inline for (struct_info.fields) |field| {
+                if (!eql(@field(a, field.name), @field(b, field.name))) return false;
+            }
+
+            return true;
+        },
+
+        .@"union" => |union_info| {
+            if (union_info.tag_type == null) {
+                @compileError("Unable to compare untagged union values for type " ++ @typeName(T));
+            }
+
+            const Tag = std.meta.Tag(T);
+            const aTag = @as(Tag, a);
+            const bTag = @as(Tag, b);
+
+            if (!eql(aTag, bTag)) return false;
+
+            switch (a) {
+                inline else => |val, tag| {
+                    return eql(val, @field(b, @tagName(tag)));
+                },
+            }
+        },
+
+        .optional => {
+            return if (a) |a_inner|
+                if (b) |b_inner|
+                    eql(a_inner, b_inner)
+                else
+                    false
+            else if (b) false else true;
+        },
+
+        .error_union => {
+            return if (a) |a_ok_inner|
+                if (b) |b_ok_inner|
+                    eql(a_ok_inner, b_ok_inner)
+                else
+                    false
+            else |a_err_inner| if (b) false else |b_err_inner| eql(a_err_inner, b_err_inner);
+        },
     }
-};
-
-fn OnReceive(comptime S: type, comptime R: type) fn (*ExpectMap, *Server(S, R, *ExpectMap), usize, R) void {
-    return struct {
-        fn onReceive(expected: *ExpectMap, _: *Server(S, R, *ExpectMap), _: usize, _: R) void {
-            expected.received(.server_receive) catch |e| {
-                std.debug.panic("{any}\n", .{e});
-            };
-        }
-    }.onReceive;
 }
 
-fn OnConnect(comptime S: type, comptime R: type) fn (*ExpectMap, *Server(S, R, *ExpectMap), usize) void {
-    return struct {
-        fn onConnect(expected: *ExpectMap, _: *Server(S, R, *ExpectMap), _: usize) void {
-            expected.received(.server_connect) catch |e| {
-                std.debug.panic("{any}\n", .{e});
-            };
-        }
-    }.onConnect;
+fn eql(a: anytype, b: @TypeOf(a)) bool {
+    return eqlInner(@TypeOf(a), a, b);
 }
 
-fn OnDisconnect(comptime S: type, comptime R: type) fn (*ExpectMap, *Server(S, R, *ExpectMap), usize) void {
-    return struct {
-        fn onDisonnect(expected: *ExpectMap, _: *Server(S, R, *ExpectMap), _: usize) void {
-            expected.received(.server_disconnect) catch |e| {
-                std.debug.panic("{any}\n", .{e});
+fn indexOf(comptime T: type, slice: []const T, value: T) ?usize {
+    for (slice, 0..) |current, i| {
+        if (eql(current, value)) return i;
+    }
+
+    return null;
+}
+
+fn ExpectValue(comptime S: type, comptime C: type) type {
+    return union(enum) {
+        const Self = @This();
+
+        server_receive: struct { usize, S },
+        server_connect: usize,
+        server_disconnect: usize,
+        client_receive: C,
+        client_disconnected,
+
+        pub fn format(self: Self, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+            try switch (self) {
+                .server_receive => |inner| writer.print(".server_receive({d}, {any})", .{ inner.@"0", inner.@"1" }),
+                .server_connect => |client_id| writer.print(".server_connect({d})", .{client_id}),
+                .server_disconnect => |client_id| writer.print(".server_disconnect({d})", .{client_id}),
+                .client_receive => |data| writer.print(".client_receive({any})", .{data}),
+                .client_disconnected => writer.print(".client_disconnected", .{}),
             };
         }
-    }.onDisonnect;
+    };
+}
+
+fn ExpectMap(comptime S: type, comptime C: type) type {
+    return struct {
+        const Self = @This();
+
+        pub const Value = ExpectValue(S, C);
+
+        expected: ArrayList(Value),
+        mutex: Mutex,
+
+        pub fn init(allocator: Allocator) Self {
+            return Self{
+                .expected = ArrayList(Value).init(allocator),
+                .mutex = Mutex{},
+            };
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            self.expected.deinit();
+        }
+
+        pub fn expect(self: *Self, value: Value) !void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            try self.expected.append(value);
+        }
+
+        pub fn received(self: *Self, value: Value) !void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            if (indexOf(Value, self.expected.items, value)) |index| {
+                _ = self.expected.swapRemove(index);
+            } else {
+                std.debug.panic("unexpected event received: {any}\n", .{value});
+            }
+        }
+
+        pub fn done(self: *Self) !void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            if (self.expected.items.len > 0) {
+                for (self.expected.items) |value| {
+                    std.debug.print("expected event not received: {any}\n", .{value});
+                }
+
+                std.debug.panic("some expected events were never received\n", .{});
+            }
+        }
+
+        pub fn ServerOnReceive() fn (*ExpectMap(S, C), *Server(C, S, *ExpectMap(S, C)), usize, Parsed(S)) void {
+            return struct {
+                fn serverOnReceive(expected: *ExpectMap(S, C), _: *Server(C, S, *ExpectMap(S, C)), client_id: usize, data: Parsed(S)) void {
+                    defer data.deinit();
+
+                    expected.received(.{ .server_receive = .{ client_id, data.value } }) catch |e| {
+                        std.debug.panic("{any}\n", .{e});
+                    };
+                }
+            }.serverOnReceive;
+        }
+
+        pub fn ServerOnConnect() fn (*ExpectMap(S, C), *Server(C, S, *ExpectMap(S, C)), usize) void {
+            return struct {
+                fn serverOnConnect(expected: *ExpectMap(S, C), _: *Server(C, S, *ExpectMap(S, C)), client_id: usize) void {
+                    expected.received(.{ .server_connect = client_id }) catch |e| {
+                        std.debug.panic("{any}\n", .{e});
+                    };
+                }
+            }.serverOnConnect;
+        }
+
+        pub fn ServerOnDisconnect() fn (*ExpectMap(S, C), *Server(C, S, *ExpectMap(S, C)), usize) void {
+            return struct {
+                fn serverOnDisonnect(expected: *ExpectMap(S, C), _: *Server(C, S, *ExpectMap(S, C)), client_id: usize) void {
+                    expected.received(.{ .server_disconnect = client_id }) catch |e| {
+                        std.debug.panic("{any}\n", .{e});
+                    };
+                }
+            }.serverOnDisonnect;
+        }
+
+        pub fn ClientOnReceive() fn (*ExpectMap(S, C), *Client(S, C, *ExpectMap(S, C)), Parsed(C)) void {
+            return struct {
+                fn clientOnReceive(expected: *ExpectMap(S, C), _: *Client(S, C, *ExpectMap(S, C)), data: Parsed(C)) void {
+                    defer data.deinit();
+
+                    expected.received(.{ .client_receive = data.value }) catch |e| {
+                        std.debug.panic("{any}\n", .{e});
+                    };
+                }
+            }.clientOnReceive;
+        }
+
+        pub fn ClientOnDisconnected() fn (*ExpectMap(S, C), *Client(S, C, *ExpectMap(S, C))) void {
+            return struct {
+                fn clientOnDisconnected(expected: *ExpectMap(S, C), _: *Client(S, C, *ExpectMap(S, C))) void {
+                    expected.received(.client_disconnected) catch |e| {
+                        std.debug.panic("{any}\n", .{e});
+                    };
+                }
+            }.clientOnDisconnected;
+        }
+    };
 }
 
 test "serialize and deserialize" {
@@ -145,7 +304,7 @@ test "serialize and deserialize" {
         .bar = "baz",
     };
 
-    var value_serialized = std.ArrayList(u8).init(testing.allocator);
+    var value_serialized = ArrayList(u8).init(testing.allocator);
     defer value_serialized.deinit();
 
     try util.serialize(value, value_serialized.writer());
@@ -200,10 +359,10 @@ test "crypto" {
     try testing.expectEqual(shared_key1, shared_key2);
 
     const aes_message = "Hello, AES!";
-    var aes_encrypted1 = std.ArrayList(u8).init(testing.allocator);
+    var aes_encrypted1 = ArrayList(u8).init(testing.allocator);
     defer aes_encrypted1.deinit();
     try crypto.aesEncrypt(shared_key1, aes_message, aes_encrypted1.writer());
-    var aes_decrypted1 = std.ArrayList(u8).init(testing.allocator);
+    var aes_decrypted1 = ArrayList(u8).init(testing.allocator);
     defer aes_decrypted1.deinit();
     try crypto.aesDecrypt(shared_key1, aes_encrypted1.items, aes_decrypted1.writer());
     std.debug.print("Original string:          '{s}'\n", .{aes_message});
@@ -211,10 +370,10 @@ test "crypto" {
     std.debug.print("Alice's decrypted string: '{s}'\n", .{aes_decrypted1.items});
     try testing.expectEqualStrings(aes_decrypted1.items, aes_message);
     try testing.expect(!std.mem.eql(u8, aes_encrypted1.items, aes_message));
-    var aes_encrypted2 = std.ArrayList(u8).init(testing.allocator);
+    var aes_encrypted2 = ArrayList(u8).init(testing.allocator);
     defer aes_encrypted2.deinit();
     try crypto.aesEncrypt(shared_key2, aes_message, aes_encrypted2.writer());
-    var aes_decrypted2 = std.ArrayList(u8).init(testing.allocator);
+    var aes_decrypted2 = ArrayList(u8).init(testing.allocator);
     defer aes_decrypted2.deinit();
     try crypto.aesDecrypt(shared_key2, aes_encrypted2.items, aes_decrypted2.writer());
     std.debug.print("Original string:          '{s}'\n", .{aes_message});
@@ -226,24 +385,25 @@ test "crypto" {
 }
 
 test "server serving" {
-    var expected = ExpectMap.init(testing.allocator);
-    defer expected.deinit();
-    try expected.expect(.server_receive, 0);
-    try expected.expect(.server_connect, 0);
-    try expected.expect(.server_disconnect, 0);
+    var thread_safe_allocator = threadSafeAllocator();
+    const allocator = thread_safe_allocator.allocator();
 
-    var server = Server(i32, []const u8, *ExpectMap).init(testing.allocator, &expected, .{
-        .on_receive = OnReceive(i32, []const u8),
-        .on_connect = OnConnect(i32, []const u8),
-        .on_disconnect = OnDisconnect(i32, []const u8),
+    const EM = ExpectMap([]const u8, i32);
+    var expected = EM.init(allocator);
+    defer expected.deinit();
+
+    var server = Server(i32, []const u8, *EM).init(allocator, &expected, .{
+        .on_receive = EM.ServerOnReceive(),
+        .on_connect = EM.ServerOnConnect(),
+        .on_disconnect = EM.ServerOnDisconnect(),
     });
     try testing.expect(!server.serving());
     try server.start(SERVER_HOST, SERVER_PORT);
     sleep();
 
     try testing.expect(server.serving());
-    const addr = try server.getAddress();
-    std.debug.print("Server address: {}\n", .{addr});
+    const server_addr = try server.getAddress();
+    std.debug.print("Server address: {}\n", .{server_addr});
 
     try server.stop();
     sleep();
@@ -254,11 +414,92 @@ test "server serving" {
 }
 
 test "addresses" {
-    // TODO
+    var thread_safe_allocator = threadSafeAllocator();
+    const allocator = thread_safe_allocator.allocator();
+
+    const EM = ExpectMap([]const u8, i32);
+    var expected = EM.init(allocator);
+    defer expected.deinit();
+    try expected.expect(.{ .server_connect = 0 });
+    try expected.expect(.{ .server_disconnect = 0 });
+
+    var server = Server(i32, []const u8, *EM).init(allocator, &expected, .{
+        .on_receive = EM.ServerOnReceive(),
+        .on_connect = EM.ServerOnConnect(),
+        .on_disconnect = EM.ServerOnDisconnect(),
+    });
+    try server.start(SERVER_HOST, SERVER_PORT);
+    sleep();
+
+    const server_addr = try server.getAddress();
+    std.debug.print("Server address: {}\n", .{server_addr});
+
+    var client = Client([]const u8, i32, *EM).init(allocator, &expected, .{
+        .on_receive = EM.ClientOnReceive(),
+        .on_disconnected = EM.ClientOnDisconnected(),
+    });
+    try client.connect(SERVER_HOST, server_addr.getPort());
+    sleep();
+
+    const client_addr = try server.getClientAddress(0);
+    std.debug.print("Client address: {}\n", .{client_addr});
+
+    try client.disconnect();
+    sleep();
+
+    try server.stop();
+    sleep();
+
+    try expected.done();
 }
 
 test "send" {
-    // TODO
+    const message_from_server = 29275;
+    const message_from_client = "Hello, server!";
+
+    var thread_safe_allocator = threadSafeAllocator();
+    const allocator = thread_safe_allocator.allocator();
+
+    const EM = ExpectMap([]const u8, i32);
+    var expected = EM.init(allocator);
+    defer expected.deinit();
+    try expected.expect(.{ .server_connect = 0 });
+    try expected.expect(.{ .client_receive = message_from_server });
+    try expected.expect(.{ .server_receive = .{ 0, message_from_client } });
+    try expected.expect(.{ .server_disconnect = 0 });
+
+    var server = Server(i32, []const u8, *EM).init(allocator, &expected, .{
+        .on_receive = EM.ServerOnReceive(),
+        .on_connect = EM.ServerOnConnect(),
+        .on_disconnect = EM.ServerOnDisconnect(),
+    });
+    try server.start(SERVER_HOST, SERVER_PORT);
+    sleep();
+
+    const server_addr = try server.getAddress();
+    std.debug.print("Server address: {}\n", .{server_addr});
+
+    var client = Client([]const u8, i32, *EM).init(allocator, &expected, .{
+        .on_receive = EM.ClientOnReceive(),
+        .on_disconnected = EM.ClientOnDisconnected(),
+    });
+    try client.connectViaAddress(server_addr);
+    sleep();
+
+    const client_addr = try server.getClientAddress(0);
+    std.debug.print("Client address: {}\n", .{client_addr});
+
+    try server.sendAll(message_from_server);
+    try client.send(message_from_client);
+    sleep();
+
+    try client.disconnect();
+    sleep();
+
+    try server.stop();
+    sleep();
+
+    try expected.done();
 }
 
 test "large send" {

@@ -1,5 +1,15 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
+const Stream = std.net.Stream;
+const Parsed = std.json.Parsed;
+const native_os = builtin.os.tag;
+const windows = std.os.windows;
+const posix = std.posix;
+const FIONBIO = windows.ws2_32.FIONBIO;
+const F_GETFL = 3;
+const F_SETFL = 4;
+const O_NONBLOCK: usize = 0o4000;
 
 pub const LENSIZE = 5;
 
@@ -9,8 +19,8 @@ pub fn serialize(data: anytype, out_stream: anytype) !void {
     try std.json.stringify(data, .{}, out_stream);
 }
 
-pub fn deserialize(comptime T: type, data_serialized: []const u8, allocator: Allocator) !std.json.Parsed(T) {
-    return try std.json.parseFromSlice(T, allocator, data_serialized, .{});
+pub fn deserialize(comptime T: type, data_serialized: []const u8, allocator: Allocator) !Parsed(T) {
+    return try std.json.parseFromSlice(T, allocator, data_serialized, .{ .allocate = .alloc_always });
 }
 
 pub fn encodeMessageSize(size: usize) [LENSIZE]u8 {
@@ -33,4 +43,30 @@ pub fn decodeMessageSize(encoded_size: [LENSIZE]u8) usize {
     }
 
     return size;
+}
+
+pub fn setBlocking(sock: Stream, blocking: bool) !void {
+    // try posix.setsockopt(sock.handle, posix.SOL.SOCKET, posix.SO.NONBLOCK, &mem.toBytes(@as(c_int, 1)));
+
+    if (native_os == .windows) {
+        var mode: u32 = if (blocking) 0 else 1;
+        const err_code = windows.ws2_32.ioctlsocket(sock.handle, FIONBIO, &mode);
+
+        if (err_code != 0) {
+            return windows.unexpectedWSAError(windows.ws2_32.WSAGetLastError());
+        }
+    } else {
+        const getfl = try posix.fcntl(sock.handle, F_GETFL, 0);
+
+        const arg = if (blocking)
+            getfl & ~O_NONBLOCK
+        else
+            getfl | O_NONBLOCK;
+
+        const err_code = try posix.fcntl(sock.handle, F_SETFL, arg);
+
+        if (err_code == -1) {
+            return posix.unexpectedErrno(posix.errno(err_code));
+        }
+    }
 }

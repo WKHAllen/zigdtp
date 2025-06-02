@@ -6,8 +6,8 @@ const Allocator = std.mem.Allocator;
 const net = std.net;
 const Stream = net.Stream;
 const Listener = net.Server;
+const ReadError = std.posix.ReadError;
 const AcceptError = Listener.AcceptError;
-const Connection = Listener.Connection;
 const Address = net.Address;
 const Thread = std.Thread;
 const Parsed = std.json.Parsed;
@@ -32,15 +32,14 @@ const ServerState = union(enum) {
 
 pub fn ServerOptions(comptime S: type, comptime R: type, comptime C: type) type {
     return struct {
-        on_receive: ?*const fn (C, *Server(S, R, C), usize, R) void = null,
+        on_receive: ?*const fn (C, *Server(S, R, C), usize, Parsed(R)) void = null,
         on_connect: ?*const fn (C, *Server(S, R, C), usize) void = null,
         on_disconnect: ?*const fn (C, *Server(S, R, C), usize) void = null,
     };
 }
 
-fn callOnReceiveInner(comptime S: type, comptime R: type, comptime C: type, on_receive: *const fn (C, *Server(S, R, C), usize, R) void, ctx: C, server: *Server(S, R, C), client_id: usize, data_parsed: Parsed(R)) void {
-    on_receive(ctx, server, client_id, data_parsed.value);
-    data_parsed.deinit();
+fn callOnReceiveInner(comptime S: type, comptime R: type, comptime C: type, on_receive: *const fn (C, *Server(S, R, C), usize, Parsed(R)) void, ctx: C, server: *Server(S, R, C), client_id: usize, data: Parsed(R)) void {
+    on_receive(ctx, server, client_id, data);
 }
 
 fn callOnConnectInner(comptime S: type, comptime R: type, comptime C: type, on_connect: *const fn (C, *Server(S, R, C), usize) void, ctx: C, server: *Server(S, R, C), client_id: usize) void {
@@ -93,6 +92,8 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
             if (self.serving()) {
                 self.stop() catch {};
             }
+
+            self.* = undefined;
         }
 
         pub fn start(self: *Self, host: []const u8, port: u16) Error!void {
@@ -109,7 +110,7 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
                 return Error.AlreadyServing;
             }
 
-            const listener = try address.listen(.{ .reuse_address = true, .reuse_port = true, .force_nonblocking = true });
+            const listener = try address.listen(.{ .reuse_address = true, .force_nonblocking = true });
 
             self.state = .{ .serving = .{ .sock = listener, .clients = std.AutoHashMap(usize, ClientRepr).init(self.allocator), .next_client_id = 0 } };
 
@@ -139,7 +140,7 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
             }
         }
 
-        pub fn send(self: *Self, data: R, client_id: usize) Error!void {
+        pub fn send(self: *Self, data: S, client_id: usize) Error!void {
             switch (self.state) {
                 .not_serving => return Error.NotServing,
                 .serving => |state| {
@@ -153,8 +154,11 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
                         try crypto.aesEncrypt(client.key, data_serialized.items, data_encrypted.writer());
 
                         const encoded_size = util.encodeMessageSize(data_encrypted.items.len);
-                        try client.sock.writeAll(&encoded_size);
-                        try client.sock.writeAll(data_encrypted.items);
+                        var message = try std.ArrayList(u8).initCapacity(self.allocator, data_encrypted.items.len + util.LENSIZE);
+                        defer message.deinit();
+                        try message.appendSlice(&encoded_size);
+                        try message.appendSlice(data_encrypted.items);
+                        try client.sock.writeAll(message.items);
                     } else {
                         return Error.ClientDoesNotExist;
                     }
@@ -162,7 +166,7 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
             }
         }
 
-        pub fn sendMultiple(self: *Self, data: R, client_ids: []const usize) Error!void {
+        pub fn sendMultiple(self: *Self, data: S, client_ids: []const usize) Error!void {
             switch (self.state) {
                 .not_serving => return Error.NotServing,
                 .serving => |_| {
@@ -171,11 +175,15 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
             }
         }
 
-        pub fn sendAll(self: *Self, data: R) Error!void {
+        pub fn sendAll(self: *Self, data: S) Error!void {
             switch (self.state) {
                 .not_serving => return Error.NotServing,
                 .serving => |state| {
-                    for (state.clients.keys()) |client_id| try self.send(data, client_id);
+                    var iter = state.clients.keyIterator();
+
+                    while (iter.next()) |client_id| {
+                        try self.send(data, client_id.*);
+                    }
                 },
             }
         }
@@ -219,9 +227,9 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
             }
         }
 
-        fn callOnReceive(self: *Self, client_id: usize, data_parsed: Parsed(R)) Thread.SpawnError!void {
+        fn callOnReceive(self: *Self, client_id: usize, data: Parsed(R)) Thread.SpawnError!void {
             if (self.options.on_receive) |on_receive| {
-                const thread = try Thread.spawn(.{}, callOnReceiveInner, .{ S, R, C, on_receive, self.ctx, self, client_id, data_parsed });
+                const thread = try Thread.spawn(.{}, callOnReceiveInner, .{ S, R, C, on_receive, self.ctx, self, client_id, data });
                 thread.detach();
             }
         }
@@ -241,6 +249,8 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
         }
 
         fn exchangeKeys(self: *Self, sock: Stream, address: Address) Error!void {
+            try util.setBlocking(sock, true);
+
             const public_key = crypto.newKeyPair().public_key;
             try sock.writeAll(&public_key);
 
@@ -254,6 +264,8 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
             if (n != other_intermediate_shared_key.len) return Error.KeyExchangeFailed;
 
             const shared_key = try crypto.dh2(other_intermediate_shared_key, secret_key);
+
+            try util.setBlocking(sock, false);
 
             switch (self.state) {
                 .serving => |*state| {
@@ -308,11 +320,16 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
             while (true) {
                 switch (self.state) {
                     .not_serving => break,
-                    .serving => |state| if (state.clients.get(client_id)) |client| {
+                    .serving => |*state| if (state.clients.get(client_id)) |client| {
                         const should_continue = try self.handleClientMessage(client_id, client);
-                        if (!should_continue) break;
+                        if (!should_continue) {
+                            client.sock.close();
+                            _ = state.clients.remove(client_id);
+                        }
                     } else break,
                 }
+
+                Thread.sleep(util.SLEEP_TIME);
             }
 
             try self.callOnDisconnect(client_id);
@@ -320,12 +337,18 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
 
         fn handleClientMessage(self: *Self, client_id: usize, client: ClientRepr) Error!bool {
             var size_buffer: [util.LENSIZE]u8 = undefined;
-            const n1 = client.sock.readAll(&size_buffer) catch return false;
+            const n1 = client.sock.readAll(&size_buffer) catch |err| {
+                return switch (err) {
+                    ReadError.WouldBlock => true,
+                    else => false,
+                };
+            };
             if (n1 != size_buffer.len) return false;
             const message_size = util.decodeMessageSize(size_buffer);
 
             var data_encrypted = try std.ArrayList(u8).initCapacity(self.allocator, message_size);
             defer data_encrypted.deinit();
+            data_encrypted.expandToCapacity();
             const n2 = client.sock.readAll(data_encrypted.items) catch return false;
             if (n2 != data_encrypted.items.len) return false;
 
@@ -333,8 +356,8 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
             defer data_serialized.deinit();
             try crypto.aesDecrypt(client.key, data_encrypted.items, data_serialized.writer());
 
-            const data_parsed = try util.deserialize(R, data_serialized.items, self.allocator);
-            try self.callOnReceive(client_id, data_parsed);
+            const data = try util.deserialize(R, data_serialized.items, self.allocator);
+            try self.callOnReceive(client_id, data);
 
             return true;
         }
