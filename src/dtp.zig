@@ -323,6 +323,18 @@ fn ExpectMap(comptime S: type, comptime C: type) type {
     };
 }
 
+fn serverOnReceiveRespond(expected: *ExpectMap([]const u8, i32), server: *Server(i32, []const u8, *ExpectMap([]const u8, i32)), client_id: usize, data: Parsed([]const u8)) void {
+    defer data.deinit();
+
+    expected.received(.{ .server_receive = .{ client_id, data.value } }) catch |e| {
+        std.debug.panic("{any}\n", .{e});
+    };
+
+    server.send(@intCast(data.value.len), client_id) catch |e| {
+        std.debug.panic("{any}\n", .{e});
+    };
+}
+
 test "serialize and deserialize" {
     const Foo = struct {
         id: usize,
@@ -458,9 +470,11 @@ test "addresses" {
         .on_connect = EM.ServerOnConnect(),
         .on_disconnect = EM.ServerOnDisconnect(),
     });
+    try testing.expect(!server.serving());
     try server.start(SERVER_HOST, SERVER_PORT);
     sleep();
 
+    try testing.expect(server.serving());
     const server_addr = try server.getAddress();
     std.debug.print("Server address: {}\n", .{server_addr});
 
@@ -468,17 +482,23 @@ test "addresses" {
         .on_receive = EM.ClientOnReceive(),
         .on_disconnected = EM.ClientOnDisconnected(),
     });
+    try testing.expect(!client.connected());
     try client.connect(SERVER_HOST, server_addr.getPort());
     sleep();
 
+    try testing.expect(client.connected());
     const client_addr = try server.getClientAddress(0);
     std.debug.print("Client address: {}\n", .{client_addr});
 
     try client.disconnect();
     sleep();
 
+    try testing.expect(!client.connected());
+
     try server.stop();
     sleep();
+
+    try testing.expect(!server.serving());
 
     try expected.done();
 }
@@ -704,15 +724,167 @@ test "sending custom types" {
 }
 
 test "multiple clients" {
-    // TODO
+    var thread_safe_allocator = threadSafeAllocator();
+    const allocator = thread_safe_allocator.allocator();
+
+    const message_from_server = 29275;
+    const message_from_client1 = "Hello from client #1!";
+    const message_from_client2 = "Goodbye from client #2!";
+
+    const EM = ExpectMap([]const u8, i32);
+    var expected = EM.init(allocator);
+    defer expected.deinit();
+    try expected.expect(.{ .server_connect = 0 });
+    try expected.expect(.{ .server_connect = 1 });
+    try expected.expect(.{ .client_receive = message_from_server });
+    try expected.expect(.{ .client_receive = message_from_server });
+    try expected.expect(.{ .server_receive = .{ 0, message_from_client1 } });
+    try expected.expect(.{ .server_receive = .{ 1, message_from_client2 } });
+    try expected.expect(.{ .client_receive = message_from_client1.len });
+    try expected.expect(.{ .client_receive = message_from_client2.len });
+    try expected.expect(.{ .server_disconnect = 0 });
+    try expected.expect(.{ .server_disconnect = 1 });
+
+    var server = Server(i32, []const u8, *EM).init(allocator, &expected, .{
+        .on_receive = serverOnReceiveRespond,
+        .on_connect = EM.ServerOnConnect(),
+        .on_disconnect = EM.ServerOnDisconnect(),
+    });
+    try server.start(SERVER_HOST, SERVER_PORT);
+    sleep();
+
+    const server_addr = try server.getAddress();
+    std.debug.print("Server address: {}\n", .{server_addr});
+
+    var client1 = Client([]const u8, i32, *EM).init(allocator, &expected, .{
+        .on_receive = EM.ClientOnReceive(),
+        .on_disconnected = EM.ClientOnDisconnected(),
+    });
+    try client1.connectViaAddress(server_addr);
+    sleep();
+
+    const client1_addr = try server.getClientAddress(0);
+    std.debug.print("Client 1 address: {}\n", .{client1_addr});
+
+    var client2 = Client([]const u8, i32, *EM).init(allocator, &expected, .{
+        .on_receive = EM.ClientOnReceive(),
+        .on_disconnected = EM.ClientOnDisconnected(),
+    });
+    try client2.connectViaAddress(server_addr);
+    sleep();
+
+    const client2_addr = try server.getClientAddress(1);
+    std.debug.print("Client 2 address: {}\n", .{client2_addr});
+
+    try server.sendAll(message_from_server);
+    try client1.send(message_from_client1);
+    try client2.send(message_from_client2);
+    sleep();
+
+    try client1.disconnect();
+    sleep();
+
+    try client2.disconnect();
+    sleep();
+
+    try server.stop();
+    sleep();
+
+    try expected.done();
 }
 
 test "remove client" {
-    // TODO
+    var thread_safe_allocator = threadSafeAllocator();
+    const allocator = thread_safe_allocator.allocator();
+
+    const EM = ExpectMap([]const u8, i32);
+    var expected = EM.init(allocator);
+    defer expected.deinit();
+    try expected.expect(.{ .server_connect = 0 });
+    try expected.expect(.{ .server_disconnect = 0 });
+    try expected.expect(.client_disconnected);
+
+    var server = Server(i32, []const u8, *EM).init(allocator, &expected, .{
+        .on_receive = EM.ServerOnReceive(),
+        .on_connect = EM.ServerOnConnect(),
+        .on_disconnect = EM.ServerOnDisconnect(),
+    });
+    try testing.expect(!server.serving());
+    try server.start(SERVER_HOST, SERVER_PORT);
+    sleep();
+
+    try testing.expect(server.serving());
+    const server_addr = try server.getAddress();
+    std.debug.print("Server address: {}\n", .{server_addr});
+
+    var client = Client([]const u8, i32, *EM).init(allocator, &expected, .{
+        .on_receive = EM.ClientOnReceive(),
+        .on_disconnected = EM.ClientOnDisconnected(),
+    });
+    try testing.expect(!client.connected());
+    try client.connect(SERVER_HOST, server_addr.getPort());
+    sleep();
+
+    try testing.expect(client.connected());
+    const client_addr = try server.getClientAddress(0);
+    std.debug.print("Client address: {}\n", .{client_addr});
+
+    try server.removeClient(0);
+    sleep();
+
+    try testing.expect(!client.connected());
+
+    try server.stop();
+    sleep();
+
+    try testing.expect(!server.serving());
+
+    try expected.done();
 }
 
 test "stop server while client connected" {
-    // TODO
+    var thread_safe_allocator = threadSafeAllocator();
+    const allocator = thread_safe_allocator.allocator();
+
+    const EM = ExpectMap([]const u8, i32);
+    var expected = EM.init(allocator);
+    defer expected.deinit();
+    try expected.expect(.{ .server_connect = 0 });
+    try expected.expect(.{ .server_disconnect = 0 });
+    try expected.expect(.client_disconnected);
+
+    var server = Server(i32, []const u8, *EM).init(allocator, &expected, .{
+        .on_receive = EM.ServerOnReceive(),
+        .on_connect = EM.ServerOnConnect(),
+        .on_disconnect = EM.ServerOnDisconnect(),
+    });
+    try testing.expect(!server.serving());
+    try server.start(SERVER_HOST, SERVER_PORT);
+    sleep();
+
+    try testing.expect(server.serving());
+    const server_addr = try server.getAddress();
+    std.debug.print("Server address: {}\n", .{server_addr});
+
+    var client = Client([]const u8, i32, *EM).init(allocator, &expected, .{
+        .on_receive = EM.ClientOnReceive(),
+        .on_disconnected = EM.ClientOnDisconnected(),
+    });
+    try testing.expect(!client.connected());
+    try client.connect(SERVER_HOST, server_addr.getPort());
+    sleep();
+
+    try testing.expect(client.connected());
+    const client_addr = try server.getClientAddress(0);
+    std.debug.print("Client address: {}\n", .{client_addr});
+
+    try server.stop();
+    sleep();
+
+    try testing.expect(!server.serving());
+    try testing.expect(!client.connected());
+
+    try expected.done();
 }
 
 test "example" {

@@ -215,7 +215,7 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
         pub fn removeClient(self: *Self, client_id: usize) Error!void {
             switch (self.state) {
                 .not_serving => return Error.NotServing,
-                .serving => |state| {
+                .serving => |*state| {
                     if (state.clients.fetchRemove(client_id)) |client_entry| {
                         util.tryClose(client_entry.value.sock) catch {};
 
