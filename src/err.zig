@@ -7,4 +7,5 @@ pub const Error = error{
     AlreadyServing,
     ClientDoesNotExist,
     KeyExchangeFailed,
+    SocketCloseFailed,
 } || std.net.TcpConnectToHostError || std.Thread.SpawnError || std.io.AnyWriter.Error;

@@ -124,7 +124,7 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
                     var iter = state.clients.valueIterator();
 
                     while (iter.next()) |client| {
-                        client.sock.close();
+                        util.tryClose(client.sock) catch {};
 
                         if (client.serve_client_thread) |serve_client_thread| serve_client_thread.join();
                     }
@@ -217,7 +217,7 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
                 .not_serving => return Error.NotServing,
                 .serving => |state| {
                     if (state.clients.fetchRemove(client_id)) |client_entry| {
-                        client_entry.value.sock.close();
+                        util.tryClose(client_entry.value.sock) catch {};
 
                         if (client_entry.value.serve_client_thread) |serve_client_thread| serve_client_thread.join();
                     } else {
@@ -323,7 +323,7 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
                     .serving => |*state| if (state.clients.get(client_id)) |client| {
                         const should_continue = try self.handleClientMessage(client_id, client);
                         if (!should_continue) {
-                            client.sock.close();
+                            util.tryClose(client.sock) catch {};
                             _ = state.clients.remove(client_id);
                         }
                     } else break,

@@ -19,6 +19,8 @@ const ThreadSafeAllocator = std.heap.ThreadSafeAllocator;
 const Thread = std.Thread;
 const Mutex = Thread.Mutex;
 const Parsed = std.json.Parsed;
+const Random = std.Random;
+const Xoshiro256 = Random.Xoshiro256;
 
 const SERVER_HOST = "127.0.0.1";
 const SERVER_PORT = 0;
@@ -28,10 +30,38 @@ fn sleep() void {
     Thread.sleep(SLEEP_TIME);
 }
 
+fn sleepFor(seconds: f64) void {
+    Thread.sleep(@intFromFloat(seconds * 1_000_000_000.0));
+}
+
 fn threadSafeAllocator() ThreadSafeAllocator {
     return ThreadSafeAllocator{
         .child_allocator = testing.allocator,
     };
+}
+
+fn rngInstance() !Xoshiro256 {
+    return std.Random.DefaultPrng.init(blk: {
+        var seed: u64 = undefined;
+        try std.posix.getrandom(std.mem.asBytes(&seed));
+        break :blk seed;
+    });
+}
+
+fn randomBytes(n: usize, rand: Random, allocator: Allocator) !ArrayList(u8) {
+    var bytes = try ArrayList(u8).initCapacity(allocator, n);
+    bytes.expandToCapacity();
+    rand.bytes(bytes.items);
+    return bytes;
+}
+
+fn randomMessages(min: usize, max: usize, rand: Random, allocator: Allocator) !ArrayList(u16) {
+    const n = rand.intRangeLessThan(usize, min, max);
+    var messages = try ArrayList(u16).initCapacity(allocator, n);
+    messages.expandToCapacity();
+
+    for (messages.items) |*message| message.* = rand.int(u16);
+    return messages;
 }
 
 fn eqlInner(comptime T: type, a: T, b: T) bool {
@@ -454,11 +484,11 @@ test "addresses" {
 }
 
 test "send" {
-    const message_from_server = 29275;
-    const message_from_client = "Hello, server!";
-
     var thread_safe_allocator = threadSafeAllocator();
     const allocator = thread_safe_allocator.allocator();
+
+    const message_from_server = 29275;
+    const message_from_client = "Hello, server!";
 
     const EM = ExpectMap([]const u8, i32);
     var expected = EM.init(allocator);
@@ -503,15 +533,174 @@ test "send" {
 }
 
 test "large send" {
-    // TODO
+    var thread_safe_allocator = threadSafeAllocator();
+    const allocator = thread_safe_allocator.allocator();
+
+    var prng = try rngInstance();
+    const rand = prng.random();
+
+    const message_from_server = try randomBytes(rand.intRangeLessThan(usize, 32768, 65536), rand, allocator);
+    defer message_from_server.deinit();
+    const message_from_client = try randomBytes(rand.intRangeLessThan(usize, 16384, 32768), rand, allocator);
+    defer message_from_client.deinit();
+
+    const EM = ExpectMap([]const u8, []const u8);
+    var expected = EM.init(allocator);
+    defer expected.deinit();
+    try expected.expect(.{ .server_connect = 0 });
+    try expected.expect(.{ .client_receive = message_from_server.items });
+    try expected.expect(.{ .server_receive = .{ 0, message_from_client.items } });
+    try expected.expect(.{ .server_disconnect = 0 });
+
+    var server = Server([]const u8, []const u8, *EM).init(allocator, &expected, .{
+        .on_receive = EM.ServerOnReceive(),
+        .on_connect = EM.ServerOnConnect(),
+        .on_disconnect = EM.ServerOnDisconnect(),
+    });
+    try server.start(SERVER_HOST, SERVER_PORT);
+    sleep();
+
+    const server_addr = try server.getAddress();
+    std.debug.print("Server address: {}\n", .{server_addr});
+
+    var client = Client([]const u8, []const u8, *EM).init(allocator, &expected, .{
+        .on_receive = EM.ClientOnReceive(),
+        .on_disconnected = EM.ClientOnDisconnected(),
+    });
+    try client.connectViaAddress(server_addr);
+    sleep();
+
+    const client_addr = try server.getClientAddress(0);
+    std.debug.print("Client address: {}\n", .{client_addr});
+
+    try server.sendAll(message_from_server.items);
+    try client.send(message_from_client.items);
+    sleepFor(1.0);
+
+    try client.disconnect();
+    sleep();
+
+    try server.stop();
+    sleep();
+
+    try expected.done();
 }
 
 test "sending numerous messages" {
-    // TODO
+    var thread_safe_allocator = threadSafeAllocator();
+    const allocator = thread_safe_allocator.allocator();
+
+    var prng = try rngInstance();
+    const rand = prng.random();
+
+    const messages_from_server = try randomMessages(64, 128, rand, allocator);
+    defer messages_from_server.deinit();
+    const messages_from_client = try randomMessages(128, 256, rand, allocator);
+    defer messages_from_client.deinit();
+
+    const EM = ExpectMap(u16, u16);
+    var expected = EM.init(allocator);
+    defer expected.deinit();
+    try expected.expect(.{ .server_connect = 0 });
+    for (messages_from_server.items) |message| try expected.expect(.{ .client_receive = message });
+    for (messages_from_client.items) |message| try expected.expect(.{ .server_receive = .{ 0, message } });
+    try expected.expect(.{ .server_disconnect = 0 });
+
+    var server = Server(u16, u16, *EM).init(allocator, &expected, .{
+        .on_receive = EM.ServerOnReceive(),
+        .on_connect = EM.ServerOnConnect(),
+        .on_disconnect = EM.ServerOnDisconnect(),
+    });
+    try server.start(SERVER_HOST, SERVER_PORT);
+    sleep();
+
+    const server_addr = try server.getAddress();
+    std.debug.print("Server address: {}\n", .{server_addr});
+
+    var client = Client(u16, u16, *EM).init(allocator, &expected, .{
+        .on_receive = EM.ClientOnReceive(),
+        .on_disconnected = EM.ClientOnDisconnected(),
+    });
+    try client.connectViaAddress(server_addr);
+    sleep();
+
+    const client_addr = try server.getClientAddress(0);
+    std.debug.print("Client address: {}\n", .{client_addr});
+
+    for (messages_from_server.items) |message| try server.sendAll(message);
+    for (messages_from_client.items) |message| try client.send(message);
+    sleepFor(1.0);
+
+    try client.disconnect();
+    sleep();
+
+    try server.stop();
+    sleep();
+
+    try expected.done();
 }
 
 test "sending custom types" {
-    // TODO
+    const Custom = struct {
+        a: i32,
+        b: []const u8,
+        c: []const []const u8,
+    };
+
+    var thread_safe_allocator = threadSafeAllocator();
+    const allocator = thread_safe_allocator.allocator();
+
+    const message_from_server = Custom{
+        .a = 123,
+        .b = "Hello, custom server type!",
+        .c = &[_][]const u8{ "first server item", "second server item" },
+    };
+    const message_from_client = Custom{
+        .a = 456,
+        .b = "Hello, custom client type!",
+        .c = &[_][]const u8{ "#1 client item", "client item #2", "(3) client item" },
+    };
+
+    const EM = ExpectMap(Custom, Custom);
+    var expected = EM.init(allocator);
+    defer expected.deinit();
+    try expected.expect(.{ .server_connect = 0 });
+    try expected.expect(.{ .client_receive = message_from_server });
+    try expected.expect(.{ .server_receive = .{ 0, message_from_client } });
+    try expected.expect(.{ .server_disconnect = 0 });
+
+    var server = Server(Custom, Custom, *EM).init(allocator, &expected, .{
+        .on_receive = EM.ServerOnReceive(),
+        .on_connect = EM.ServerOnConnect(),
+        .on_disconnect = EM.ServerOnDisconnect(),
+    });
+    try server.start(SERVER_HOST, SERVER_PORT);
+    sleep();
+
+    const server_addr = try server.getAddress();
+    std.debug.print("Server address: {}\n", .{server_addr});
+
+    var client = Client(Custom, Custom, *EM).init(allocator, &expected, .{
+        .on_receive = EM.ClientOnReceive(),
+        .on_disconnected = EM.ClientOnDisconnected(),
+    });
+    try client.connectViaAddress(server_addr);
+    sleep();
+
+    const client_addr = try server.getClientAddress(0);
+    std.debug.print("Client address: {}\n", .{client_addr});
+
+    try server.sendAll(message_from_server);
+    try client.send(message_from_client);
+    sleep();
+
+    try client.disconnect();
+    sleep();
+
+    try server.stop();
+    sleep();
+
+    try expected.done();
 }
 
 test "multiple clients" {

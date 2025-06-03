@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const Error = @import("err.zig").Error;
 const Allocator = std.mem.Allocator;
 const Stream = std.net.Stream;
 const Parsed = std.json.Parsed;
@@ -43,6 +44,23 @@ pub fn decodeMessageSize(encoded_size: [LENSIZE]u8) usize {
     }
 
     return size;
+}
+
+pub fn tryClose(sock: Stream) !void {
+    switch (native_os) {
+        .windows => windows.closesocket(sock.handle) catch return Error.SocketCloseFailed,
+        else => {
+            if (native_os == .wasi and !builtin.link_libc) {
+                _ = std.os.wasi.fd_close(sock.handle);
+                return;
+            }
+            switch (posix.errno(posix.system.close(sock.handle))) {
+                .BADF => return Error.SocketCloseFailed,
+                .INTR => return,
+                else => return,
+            }
+        },
+    }
 }
 
 pub fn setBlocking(sock: Stream, blocking: bool) !void {

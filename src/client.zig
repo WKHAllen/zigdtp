@@ -88,7 +88,7 @@ pub fn Client(comptime S: type, comptime R: type, comptime C: type) type {
                 .not_connected => return Error.NotConnected,
                 .connected => |state| {
                     self.state = .not_connected;
-                    state.sock.close();
+                    util.tryClose(state.sock) catch {};
 
                     if (self.handle_thread) |handle_thread| handle_thread.join();
 
@@ -187,7 +187,7 @@ pub fn Client(comptime S: type, comptime R: type, comptime C: type) type {
             switch (self.state) {
                 .not_connected => {},
                 .connected => |state| {
-                    state.sock.close();
+                    util.tryClose(state.sock) catch {};
                     self.state = .not_connected;
                 },
             }
