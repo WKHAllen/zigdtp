@@ -9,34 +9,45 @@ pub const secret_length = X25519.secret_length;
 pub const shared_length = X25519.shared_length;
 
 const Aes256 = std.crypto.core.aes.Aes256;
+/// Length (in bytes) of an AES-256 key.
 pub const key_length = Aes256.key_bits / 8;
 
+/// Performs a SHA-256 hash of a sequence of bytes.
 fn sha256(bytes: []const u8) [Sha256.digest_length]u8 {
     var hasher = Sha256.init(.{});
     hasher.update(bytes);
     return hasher.finalResult();
 }
 
+/// Generates a new X25519 key pair.
 pub fn newKeyPair() KeyPair {
     return KeyPair.generate();
 }
 
+/// Performs the math for the first half of a Diffie-Hellman key exchange.
 pub fn dh1(public_key: [public_length]u8, secret_key: [secret_length]u8) ![shared_length]u8 {
     return try X25519.scalarmult(secret_key, public_key);
 }
 
+/// Performs the math for the second half of a Diffie-Hellman key exchange,
+/// hashing the resulting shared key before returning it.
 pub fn dh2(intermediate_shared_key: [shared_length]u8, secret_key: [secret_length]u8) ![shared_length]u8 {
     const shared_key = try X25519.scalarmult(secret_key, intermediate_shared_key);
     return sha256(&shared_key);
 }
 
+/// An iterator over a sequence of bytes, providing a chunk of bytes of a given
+/// length with each call to `next`.
 fn BlocksIterator(block_size: usize) type {
     return struct {
         const Self = @This();
 
+        /// The bytes being iterated over.
         bytes: []const u8,
+        /// The current offset.
         offset: usize,
 
+        /// Constructs the iterator.
         pub fn of(bytes: []const u8) Self {
             return .{
                 .bytes = bytes,
@@ -44,6 +55,9 @@ fn BlocksIterator(block_size: usize) type {
             };
         }
 
+        /// Returns the next block of the given length, or null if the end of
+        /// the byte sequence has been reached. Note that the last block may be
+        /// shorter than the configured block size.
         pub fn next(self: *Self) ?[]const u8 {
             if (self.offset >= self.bytes.len) return null;
 
@@ -53,12 +67,16 @@ fn BlocksIterator(block_size: usize) type {
             return block;
         }
 
+        /// Returns whether the iterator has reached the end of the byte
+        /// sequence. Does not progress the state of the iterator.
         pub inline fn done(self: Self) bool {
             return self.offset >= self.bytes.len;
         }
     };
 }
 
+/// Performs an AES encryption. This handles cases where the data is not a
+/// multiple of 16 bytes long.
 pub fn aesEncrypt(key: [key_length]u8, data: []const u8, writer: anytype) !void {
     const last_block_len = if (data.len == 0) 0 else if (data.len % 16 == 0) 16 else @as(u8, @truncate(data.len % 16));
     try writer.writeByte(last_block_len);
@@ -77,6 +95,8 @@ pub fn aesEncrypt(key: [key_length]u8, data: []const u8, writer: anytype) !void 
     }
 }
 
+/// Performs an AES decryption. This handles cases where the data is not a
+/// multiple of 16 bytes long.
 pub fn aesDecrypt(key: [key_length]u8, data: []const u8, writer: anytype) !void {
     const last_block_len = @as(usize, data[0]);
 

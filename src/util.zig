@@ -3,7 +3,6 @@ const builtin = @import("builtin");
 const Error = @import("err.zig").Error;
 const Allocator = std.mem.Allocator;
 const Stream = std.net.Stream;
-const Parsed = std.json.Parsed;
 const native_os = builtin.os.tag;
 const windows = std.os.windows;
 const posix = std.posix;
@@ -12,18 +11,27 @@ const F_GETFL = 3;
 const F_SETFL = 4;
 const O_NONBLOCK: usize = 0o4000;
 
+/// A value received through a network socket. `deinit` must be called once the
+/// memory is no longer needed.
+pub const Received = std.json.Parsed;
+
+/// The length of the size portion of a message.
 pub const LENSIZE = 5;
 
+/// The amount of time to wait between repeated network operations.
 pub const SLEEP_TIME = 1_000_000;
 
+/// Serializes a value to a byte stream.
 pub fn serialize(data: anytype, out_stream: anytype) !void {
     try std.json.stringify(data, .{}, out_stream);
 }
 
-pub fn deserialize(comptime T: type, data_serialized: []const u8, allocator: Allocator) !Parsed(T) {
+/// Deserializes a byte slice into a new value of a given type.
+pub fn deserialize(comptime T: type, data_serialized: []const u8, allocator: Allocator) !Received(T) {
     return try std.json.parseFromSlice(T, allocator, data_serialized, .{ .allocate = .alloc_always });
 }
 
+/// Encodes the size portion of a message.
 pub fn encodeMessageSize(size: usize) [LENSIZE]u8 {
     var size_inner = size;
     var encoded_size: [LENSIZE]u8 = undefined;
@@ -36,6 +44,7 @@ pub fn encodeMessageSize(size: usize) [LENSIZE]u8 {
     return encoded_size;
 }
 
+/// Decodes the sizes portion of a message.
 pub fn decodeMessageSize(encoded_size: [LENSIZE]u8) usize {
     var size: usize = 0;
 
@@ -46,6 +55,9 @@ pub fn decodeMessageSize(encoded_size: [LENSIZE]u8) usize {
     return size;
 }
 
+/// Tries to close a socket, returning an error if the operation fails. This is
+/// necessary because Zig's socket API has a lot of `unreachable`s. Panicking is
+/// not a desirable side effect of simply trying to close a socket twice.
 pub fn tryClose(sock: Stream) !void {
     switch (native_os) {
         .windows => windows.closesocket(sock.handle) catch return Error.SocketCloseFailed,
@@ -63,6 +75,10 @@ pub fn tryClose(sock: Stream) !void {
     }
 }
 
+/// Sets a socket's blocking mode. This is necessary because Zig's socket API
+/// doesn't currently support this anywhere other than in server listeners.
+/// Additionally, it doesn't seem to actually set the socket to non-blocking
+/// mode on Windows.
 pub fn setBlocking(sock: Stream, blocking: bool) !void {
     // try posix.setsockopt(sock.handle, posix.SOL.SOCKET, posix.SO.NONBLOCK, &mem.toBytes(@as(c_int, 1)));
 

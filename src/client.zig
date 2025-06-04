@@ -8,44 +8,75 @@ const Stream = net.Stream;
 const ReadError = std.posix.ReadError;
 const Address = net.Address;
 const Thread = std.Thread;
-const Parsed = std.json.Parsed;
+const Received = util.Received;
 
+/// The inner client state when the client is connected to a server.
 const ClientStateInner = struct {
+    /// The client socket.
     sock: Stream,
+    /// The client's crypto key.
     key: [crypto.key_length]u8,
 };
 
+/// The outer client state, modeling whether the client is connected to a
+/// server.
 const ClientState = union(enum) {
+    /// The client is not connected to a server.
     not_connected,
+    /// The client is connected to a server.
     connected: ClientStateInner,
 };
 
+/// Client configuration options. Each option is an event handler function that
+/// is given the details of the vent, as well as the client instance and a
+/// context value configured on the client.
+///
+/// - `S` is the type that the client will send to the server.
+/// - `R` is the type that the client will receive from the server.
+/// - `C` is the type of the context value that will be available in each event
+/// handler.
 pub fn ClientOptions(comptime S: type, comptime R: type, comptime C: type) type {
     return struct {
-        on_receive: ?*const fn (C, *Client(S, R, C), Parsed(R)) void = null,
+        on_receive: ?*const fn (C, *Client(S, R, C), Received(R)) void = null,
         on_disconnected: ?*const fn (C, *Client(S, R, C)) void = null,
     };
 }
 
-fn callOnReceiveInner(comptime S: type, comptime R: type, comptime C: type, on_receive: *const fn (C, *Client(S, R, C), Parsed(R)) void, ctx: C, client: *Client(S, R, C), data: Parsed(R)) void {
+/// Calls the configured client receive handler.
+fn callOnReceiveInner(comptime S: type, comptime R: type, comptime C: type, on_receive: *const fn (C, *Client(S, R, C), Received(R)) void, ctx: C, client: *Client(S, R, C), data: Received(R)) void {
     on_receive(ctx, client, data);
 }
 
+/// Calls the configured client disconnected handler.
 fn callOnDisconnectedInner(comptime S: type, comptime R: type, comptime C: type, on_disconnected: *const fn (C, *Client(S, R, C)) void, ctx: C, client: *Client(S, R, C)) void {
     on_disconnected(ctx, client);
 }
 
+/// A network client.
+///
+/// - `S` is the type that the client will send to the server.
+/// - `R` is the type that the client will receive from the server.
+/// - `C` is the type of the context value that will be available in each event
+/// handler.
 pub fn Client(comptime S: type, comptime R: type, comptime C: type) type {
     return struct {
         const Self = @This();
 
+        /// The current state of the client.
         state: ClientState,
+        /// The thread currently handling the connection to the server.
         handle_thread: ?Thread,
+        /// Any error that has occurred while connected to the server.
         handle_error: ?Error,
+        /// The configured context to be provided in each event handler.
         ctx: C,
+        /// The configured event handlers.
         options: ClientOptions(S, R, C),
+        /// The client's allocator.
         allocator: Allocator,
 
+        /// Initializes a new network client. Call `connect` to connect to a
+        /// server.
         pub fn init(allocator: Allocator, ctx: C, options: ClientOptions(S, R, C)) Self {
             return Self{
                 .state = .not_connected,
@@ -57,6 +88,10 @@ pub fn Client(comptime S: type, comptime R: type, comptime C: type) type {
             };
         }
 
+        /// Releases all client memory. This will attempt to disconnect the
+        /// client from the server if it is still connected. Calling
+        /// `disconnect` before this is recommended, as any errors encountered
+        /// here when disconnecting from the server are discarded.
         pub fn deinit(self: *Self) void {
             if (self.connected()) {
                 self.disconnect() catch {};
@@ -65,6 +100,7 @@ pub fn Client(comptime S: type, comptime R: type, comptime C: type) type {
             self.* = undefined;
         }
 
+        /// Connects to a server at the given host and port.
         pub fn connect(self: *Self, host: []const u8, port: u16) Error!void {
             if (self.connected()) {
                 return Error.AlreadyConnected;
@@ -74,6 +110,7 @@ pub fn Client(comptime S: type, comptime R: type, comptime C: type) type {
             try self.exchangeKeys(stream);
         }
 
+        /// Connects to a server at the given address.
         pub fn connectViaAddress(self: *Self, address: Address) Error!void {
             if (self.connected()) {
                 return Error.AlreadyConnected;
@@ -83,6 +120,7 @@ pub fn Client(comptime S: type, comptime R: type, comptime C: type) type {
             try self.exchangeKeys(stream);
         }
 
+        /// Disconnects from the server.
         pub fn disconnect(self: *Self) Error!void {
             switch (self.state) {
                 .not_connected => return Error.NotConnected,
@@ -97,6 +135,7 @@ pub fn Client(comptime S: type, comptime R: type, comptime C: type) type {
             }
         }
 
+        /// Sends data to the server.
         pub fn send(self: *Self, data: S) Error!void {
             switch (self.state) {
                 .not_connected => return Error.NotConnected,
@@ -119,6 +158,7 @@ pub fn Client(comptime S: type, comptime R: type, comptime C: type) type {
             }
         }
 
+        /// Is the client currently connected to a server?
         pub fn connected(self: *Self) bool {
             return switch (self.state) {
                 .not_connected => false,
@@ -126,13 +166,17 @@ pub fn Client(comptime S: type, comptime R: type, comptime C: type) type {
             };
         }
 
-        fn callOnReceive(self: *Self, data: Parsed(R)) Thread.SpawnError!void {
+        /// Calls the configured client receive handler.
+        fn callOnReceive(self: *Self, data: Received(R)) Thread.SpawnError!void {
             if (self.options.on_receive) |on_receive| {
                 const thread = try Thread.spawn(.{}, callOnReceiveInner, .{ S, R, C, on_receive, self.ctx, self, data });
                 thread.detach();
+            } else {
+                data.deinit();
             }
         }
 
+        /// Calls the configured client disconnected handler.
         fn callOnDisconnected(self: *Self) Thread.SpawnError!void {
             if (self.options.on_disconnected) |on_disconnected| {
                 const thread = try Thread.spawn(.{}, callOnDisconnectedInner, .{ S, R, C, on_disconnected, self.ctx, self });
@@ -140,6 +184,7 @@ pub fn Client(comptime S: type, comptime R: type, comptime C: type) type {
             }
         }
 
+        /// Performs a cryptographic key exchange with the server.
         fn exchangeKeys(self: *Self, sock: Stream) Error!void {
             try util.setBlocking(sock, true);
 
@@ -165,12 +210,14 @@ pub fn Client(comptime S: type, comptime R: type, comptime C: type) type {
             self.handle_thread = try Thread.spawn(.{}, runHandle, .{self});
         }
 
+        /// A wrapper around `handle` that notes any error returned.
         fn runHandle(self: *Self) void {
             self.handle() catch |err| {
                 self.handle_error = err;
             };
         }
 
+        /// Event loop for the client.
         fn handle(self: *Self) Error!void {
             const disconnected = while (true) {
                 switch (self.state) {
@@ -195,6 +242,7 @@ pub fn Client(comptime S: type, comptime R: type, comptime C: type) type {
             if (disconnected) try self.callOnDisconnected();
         }
 
+        /// Handles a single message from the server.
         fn handleMessage(self: *Self, state: ClientStateInner) Error!bool {
             var size_buffer: [util.LENSIZE]u8 = undefined;
             const n1 = state.sock.readAll(&size_buffer) catch |err| {

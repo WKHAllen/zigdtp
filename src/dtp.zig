@@ -11,6 +11,9 @@ pub const ClientOptions = client_impl.ClientOptions;
 pub const Server = server_impl.Server;
 pub const ServerOptions = server_impl.ServerOptions;
 pub const Error = err.Error;
+/// A value received through a network socket. `deinit` must be called once the
+/// memory is no longer needed.
+pub const Received = util.Received;
 
 const testing = std.testing;
 const ArrayList = std.ArrayList;
@@ -18,28 +21,36 @@ const Allocator = std.mem.Allocator;
 const ThreadSafeAllocator = std.heap.ThreadSafeAllocator;
 const Thread = std.Thread;
 const Mutex = Thread.Mutex;
-const Parsed = std.json.Parsed;
 const Random = std.Random;
 const Xoshiro256 = Random.Xoshiro256;
 
+/// Default server host address.
 const SERVER_HOST = "127.0.0.1";
+
+/// Default server port.
 const SERVER_PORT = 0;
+
+/// Default amount of time to sleep, in nanoseconds.
 const SLEEP_TIME = 100_000_000;
 
+/// Sleep for the default duration.
 fn sleep() void {
     Thread.sleep(SLEEP_TIME);
 }
 
+/// Sleep for a desired duration.
 fn sleepFor(seconds: f64) void {
     Thread.sleep(@intFromFloat(seconds * 1_000_000_000.0));
 }
 
+/// Constructs a thread-safe allocator.
 fn threadSafeAllocator() ThreadSafeAllocator {
     return ThreadSafeAllocator{
         .child_allocator = testing.allocator,
     };
 }
 
+/// Constructs a Xoshiro256 RNG instance.
 fn rngInstance() !Xoshiro256 {
     return std.Random.DefaultPrng.init(blk: {
         var seed: u64 = undefined;
@@ -48,6 +59,8 @@ fn rngInstance() !Xoshiro256 {
     });
 }
 
+/// Generates a random sequence of `n` bytes. The caller is responsible for
+/// calling `deinit` on the returned value.
 fn randomBytes(n: usize, rand: Random, allocator: Allocator) !ArrayList(u8) {
     var bytes = try ArrayList(u8).initCapacity(allocator, n);
     bytes.expandToCapacity();
@@ -55,6 +68,8 @@ fn randomBytes(n: usize, rand: Random, allocator: Allocator) !ArrayList(u8) {
     return bytes;
 }
 
+/// Generates a sequence of random `u16` values. The caller is responsible for
+/// calling `deinit` on the returned value.
 fn randomMessages(min: usize, max: usize, rand: Random, allocator: Allocator) !ArrayList(u16) {
     const n = rand.intRangeLessThan(usize, min, max);
     var messages = try ArrayList(u16).initCapacity(allocator, n);
@@ -64,6 +79,7 @@ fn randomMessages(min: usize, max: usize, rand: Random, allocator: Allocator) !A
     return messages;
 }
 
+/// Compares two values of the same type using deep equality.
 fn eqlInner(comptime T: type, a: T, b: T) bool {
     switch (@typeInfo(T)) {
         .noreturn,
@@ -179,10 +195,12 @@ fn eqlInner(comptime T: type, a: T, b: T) bool {
     }
 }
 
+/// Compares two values of the same type using deep equality.
 fn eql(a: anytype, b: @TypeOf(a)) bool {
     return eqlInner(@TypeOf(a), a, b);
 }
 
+/// Returns the index of a given value in a slice.
 fn indexOf(comptime T: type, slice: []const T, value: T) ?usize {
     for (slice, 0..) |current, i| {
         if (eql(current, value)) return i;
@@ -191,16 +209,23 @@ fn indexOf(comptime T: type, slice: []const T, value: T) ?usize {
     return null;
 }
 
+/// A testing type. This represents a single expected event value.
 fn ExpectValue(comptime S: type, comptime C: type) type {
     return union(enum) {
         const Self = @This();
 
+        /// The server received data from a client.
         server_receive: struct { usize, S },
+        /// A client connected to the server.
         server_connect: usize,
+        /// A client disconnected from the server.
         server_disconnect: usize,
+        /// The client received data from the server.
         client_receive: C,
+        /// The client was disconnected from the server.
         client_disconnected,
 
+        /// Display implementation.
         pub fn format(self: Self, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
             try switch (self) {
                 .server_receive => |inner| writer.print(".server_receive({d}, {any})", .{ inner.@"0", inner.@"1" }),
@@ -213,15 +238,22 @@ fn ExpectValue(comptime S: type, comptime C: type) type {
     };
 }
 
+/// A testing type. This represents all expected events in a single testing
+/// context. It is thread-safe and can be shared as the context value for any
+/// number of servers and clients.
 fn ExpectMap(comptime S: type, comptime C: type) type {
     return struct {
         const Self = @This();
 
+        /// The event value type for this expect map.
         pub const Value = ExpectValue(S, C);
 
+        /// The events expected to be encountered.
         expected: ArrayList(Value),
+        /// The mutex for thread-safety.
         mutex: Mutex,
 
+        /// Initializes a new expect map.
         pub fn init(allocator: Allocator) Self {
             return Self{
                 .expected = ArrayList(Value).init(allocator),
@@ -229,6 +261,7 @@ fn ExpectMap(comptime S: type, comptime C: type) type {
             };
         }
 
+        /// Releases all allocated memory.
         pub fn deinit(self: *Self) void {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -236,6 +269,7 @@ fn ExpectMap(comptime S: type, comptime C: type) type {
             self.expected.deinit();
         }
 
+        /// Notes that an event value is expected in this testing context.
         pub fn expect(self: *Self, value: Value) !void {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -243,6 +277,8 @@ fn ExpectMap(comptime S: type, comptime C: type) type {
             try self.expected.append(value);
         }
 
+        /// Notes that an event value has been received. This will panic if the
+        /// received event was not expected.
         pub fn received(self: *Self, value: Value) !void {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -254,6 +290,8 @@ fn ExpectMap(comptime S: type, comptime C: type) type {
             }
         }
 
+        /// Checks that all expected events were received. This will panic if
+        /// any events have yet to be encountered.
         pub fn done(self: *Self) !void {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -267,9 +305,10 @@ fn ExpectMap(comptime S: type, comptime C: type) type {
             }
         }
 
-        pub fn ServerOnReceive() fn (*ExpectMap(S, C), *Server(C, S, *ExpectMap(S, C)), usize, Parsed(S)) void {
+        /// Returns a function that notes incoming server receive events.
+        pub fn ServerOnReceive() fn (*ExpectMap(S, C), *Server(C, S, *ExpectMap(S, C)), usize, Received(S)) void {
             return struct {
-                fn serverOnReceive(expected: *ExpectMap(S, C), _: *Server(C, S, *ExpectMap(S, C)), client_id: usize, data: Parsed(S)) void {
+                fn serverOnReceive(expected: *ExpectMap(S, C), _: *Server(C, S, *ExpectMap(S, C)), client_id: usize, data: Received(S)) void {
                     defer data.deinit();
 
                     expected.received(.{ .server_receive = .{ client_id, data.value } }) catch |e| {
@@ -279,6 +318,7 @@ fn ExpectMap(comptime S: type, comptime C: type) type {
             }.serverOnReceive;
         }
 
+        /// Returns a function that notes incoming server connect events.
         pub fn ServerOnConnect() fn (*ExpectMap(S, C), *Server(C, S, *ExpectMap(S, C)), usize) void {
             return struct {
                 fn serverOnConnect(expected: *ExpectMap(S, C), _: *Server(C, S, *ExpectMap(S, C)), client_id: usize) void {
@@ -289,6 +329,7 @@ fn ExpectMap(comptime S: type, comptime C: type) type {
             }.serverOnConnect;
         }
 
+        /// Returns a function that notes incoming server disconnect events.
         pub fn ServerOnDisconnect() fn (*ExpectMap(S, C), *Server(C, S, *ExpectMap(S, C)), usize) void {
             return struct {
                 fn serverOnDisonnect(expected: *ExpectMap(S, C), _: *Server(C, S, *ExpectMap(S, C)), client_id: usize) void {
@@ -299,9 +340,10 @@ fn ExpectMap(comptime S: type, comptime C: type) type {
             }.serverOnDisonnect;
         }
 
-        pub fn ClientOnReceive() fn (*ExpectMap(S, C), *Client(S, C, *ExpectMap(S, C)), Parsed(C)) void {
+        /// Returns a function that notes incoming client receive events.
+        pub fn ClientOnReceive() fn (*ExpectMap(S, C), *Client(S, C, *ExpectMap(S, C)), Received(C)) void {
             return struct {
-                fn clientOnReceive(expected: *ExpectMap(S, C), _: *Client(S, C, *ExpectMap(S, C)), data: Parsed(C)) void {
+                fn clientOnReceive(expected: *ExpectMap(S, C), _: *Client(S, C, *ExpectMap(S, C)), data: Received(C)) void {
                     defer data.deinit();
 
                     expected.received(.{ .client_receive = data.value }) catch |e| {
@@ -311,6 +353,7 @@ fn ExpectMap(comptime S: type, comptime C: type) type {
             }.clientOnReceive;
         }
 
+        /// Returns a function that notes incoming client disconnected events.
         pub fn ClientOnDisconnected() fn (*ExpectMap(S, C), *Client(S, C, *ExpectMap(S, C))) void {
             return struct {
                 fn clientOnDisconnected(expected: *ExpectMap(S, C), _: *Client(S, C, *ExpectMap(S, C))) void {
@@ -323,7 +366,10 @@ fn ExpectMap(comptime S: type, comptime C: type) type {
     };
 }
 
-fn serverOnReceiveRespond(expected: *ExpectMap([]const u8, i32), server: *Server(i32, []const u8, *ExpectMap([]const u8, i32)), client_id: usize, data: Parsed([]const u8)) void {
+/// An alternative to `ExpectMap(...).ServerOnReceive()`. This will do the same
+/// but is typed to receive strings and will always send back the length of the
+/// received string.
+fn serverOnReceiveRespond(expected: *ExpectMap([]const u8, i32), server: *Server(i32, []const u8, *ExpectMap([]const u8, i32)), client_id: usize, data: Received([]const u8)) void {
     defer data.deinit();
 
     expected.received(.{ .server_receive = .{ client_id, data.value } }) catch |e| {

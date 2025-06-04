@@ -10,46 +10,73 @@ const ReadError = std.posix.ReadError;
 const AcceptError = Listener.AcceptError;
 const Address = net.Address;
 const Thread = std.Thread;
-const Parsed = std.json.Parsed;
+const Received = util.Received;
 
+/// A representation of a single connected client.
 const ClientRepr = struct {
+    /// The client socket.
     sock: Stream,
+    /// The client's address.
     address: Address,
+    /// The crypto key unique to the client.
     key: [crypto.key_length]u8,
+    /// A handle to the thread serving the client. Despite that this is typed as
+    /// an optional, the value will always be non-null except for the moment
+    /// when the thread is being spawned.
     serve_client_thread: ?Thread,
 };
 
+/// The inner server state when the server is running.
 const ServerStateInner = struct {
+    /// The listener socket.
     sock: Listener,
+    /// A mapping of all connected clients.
     clients: std.AutoHashMap(usize, ClientRepr),
+    /// The next available client ID.
     next_client_id: usize,
 };
 
+/// The outer server state, modeling whether the server is serving.
 const ServerState = union(enum) {
+    /// The server is not serving.
     not_serving,
+    /// The server is serving.
     serving: ServerStateInner,
 };
 
+/// Server configuration options. Each option is an event handler function that
+/// is given the details of the event, as well as the server instance and a
+/// context value configured on the server.
+///
+/// - `S` is the type that the server will send to clients.
+/// - `R` is the type that the server will receive from clients.
+/// - `C` is the type of the context value that will be available in each event
+/// handler.
 pub fn ServerOptions(comptime S: type, comptime R: type, comptime C: type) type {
     return struct {
-        on_receive: ?*const fn (C, *Server(S, R, C), usize, Parsed(R)) void = null,
+        on_receive: ?*const fn (C, *Server(S, R, C), usize, Received(R)) void = null,
         on_connect: ?*const fn (C, *Server(S, R, C), usize) void = null,
         on_disconnect: ?*const fn (C, *Server(S, R, C), usize) void = null,
     };
 }
 
-fn callOnReceiveInner(comptime S: type, comptime R: type, comptime C: type, on_receive: *const fn (C, *Server(S, R, C), usize, Parsed(R)) void, ctx: C, server: *Server(S, R, C), client_id: usize, data: Parsed(R)) void {
+/// Calls the configured server receive handler.
+fn callOnReceiveInner(comptime S: type, comptime R: type, comptime C: type, on_receive: *const fn (C, *Server(S, R, C), usize, Received(R)) void, ctx: C, server: *Server(S, R, C), client_id: usize, data: Received(R)) void {
     on_receive(ctx, server, client_id, data);
 }
 
+/// Calls the configured server connect handler.
 fn callOnConnectInner(comptime S: type, comptime R: type, comptime C: type, on_connect: *const fn (C, *Server(S, R, C), usize) void, ctx: C, server: *Server(S, R, C), client_id: usize) void {
     on_connect(ctx, server, client_id);
 }
 
+/// Calls the configured server disconnect handler.
 fn callOnDisconnectInner(comptime S: type, comptime R: type, comptime C: type, on_disconnect: *const fn (C, *Server(S, R, C), usize) void, ctx: C, server: *Server(S, R, C), client_id: usize) void {
     on_disconnect(ctx, server, client_id);
 }
 
+/// Resolves an IPv4 address.
+///
 /// TODO: remove this once [this PR](https://github.com/ziglang/zig/pull/22555)
 /// is included in a major release.
 fn resolveIp(name: []const u8, port: u16) !Address {
@@ -66,17 +93,31 @@ fn resolveIp(name: []const u8, port: u16) !Address {
     return error.InvalidIPAddressFormat;
 }
 
+/// A network server.
+///
+/// - `S` is the type that the server will send to clients.
+/// - `R` is the type that the server will receive from clients.
+/// - `C` is the type of the context value that will be available in each event
+/// handler.
 pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
     return struct {
         const Self = @This();
 
+        /// The current state of the server.
         state: ServerState,
+        /// The thread currently accepting clients.
         serve_thread: ?Thread,
+        /// Any error that has occurred while serving clients.
         serve_error: ?Error,
+        /// The configured context to be provided in each event handler.
         ctx: C,
+        /// The configured event handlers.
         options: ServerOptions(S, R, C),
+        /// The server's allocator.
         allocator: Allocator,
 
+        /// Initializes a new network server. Call `start` to start listening
+        /// for clients.
         pub fn init(allocator: Allocator, ctx: C, options: ServerOptions(S, R, C)) Self {
             return Self{
                 .state = .not_serving,
@@ -88,6 +129,9 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
             };
         }
 
+        /// Releases all server memory. This will attempt to stop the server if
+        /// it is still serving. Calling `stop` before this is recommended, as
+        /// any errors encountered here when stopping the server are discarded.
         pub fn deinit(self: *Self) void {
             if (self.serving()) {
                 self.stop() catch {};
@@ -96,6 +140,7 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
             self.* = undefined;
         }
 
+        /// Starts the server listening on the given host and port.
         pub fn start(self: *Self, host: []const u8, port: u16) Error!void {
             if (self.serving()) {
                 return Error.AlreadyServing;
@@ -105,6 +150,7 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
             try self.startViaAddress(address);
         }
 
+        /// Starts the server listening on the given address.
         pub fn startViaAddress(self: *Self, address: Address) Error!void {
             if (self.serving()) {
                 return Error.AlreadyServing;
@@ -117,6 +163,7 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
             self.serve_thread = try Thread.spawn(.{}, runServe, .{self});
         }
 
+        /// Stops the server, disconnecting all clients in the process.
         pub fn stop(self: *Self) Error!void {
             switch (self.state) {
                 .not_serving => return Error.NotServing,
@@ -140,6 +187,7 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
             }
         }
 
+        /// Sends data to a client.
         pub fn send(self: *Self, data: S, client_id: usize) Error!void {
             switch (self.state) {
                 .not_serving => return Error.NotServing,
@@ -166,6 +214,7 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
             }
         }
 
+        /// Sends data to a given set of clients.
         pub fn sendMultiple(self: *Self, data: S, client_ids: []const usize) Error!void {
             switch (self.state) {
                 .not_serving => return Error.NotServing,
@@ -175,6 +224,7 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
             }
         }
 
+        /// Sends data to all clients.
         pub fn sendAll(self: *Self, data: S) Error!void {
             switch (self.state) {
                 .not_serving => return Error.NotServing,
@@ -188,6 +238,7 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
             }
         }
 
+        /// Is the server currently serving?
         pub fn serving(self: *Self) bool {
             return switch (self.state) {
                 .not_serving => false,
@@ -195,6 +246,7 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
             };
         }
 
+        /// Returns the server's address.
         pub fn getAddress(self: *Self) Error!Address {
             return switch (self.state) {
                 .not_serving => Error.NotServing,
@@ -202,6 +254,7 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
             };
         }
 
+        /// Returns a client's address.
         pub fn getClientAddress(self: *Self, client_id: usize) Error!Address {
             return switch (self.state) {
                 .not_serving => Error.NotServing,
@@ -212,6 +265,7 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
             };
         }
 
+        /// Disconnects a client from the server.
         pub fn removeClient(self: *Self, client_id: usize) Error!void {
             switch (self.state) {
                 .not_serving => return Error.NotServing,
@@ -227,13 +281,17 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
             }
         }
 
-        fn callOnReceive(self: *Self, client_id: usize, data: Parsed(R)) Thread.SpawnError!void {
+        /// Calls the configured server receive handler.
+        fn callOnReceive(self: *Self, client_id: usize, data: Received(R)) Thread.SpawnError!void {
             if (self.options.on_receive) |on_receive| {
                 const thread = try Thread.spawn(.{}, callOnReceiveInner, .{ S, R, C, on_receive, self.ctx, self, client_id, data });
                 thread.detach();
+            } else {
+                data.deinit();
             }
         }
 
+        /// Calls the configured server connect handler.
         fn callOnConnect(self: *Self, client_id: usize) Thread.SpawnError!void {
             if (self.options.on_connect) |on_connect| {
                 const thread = try Thread.spawn(.{}, callOnConnectInner, .{ S, R, C, on_connect, self.ctx, self, client_id });
@@ -241,6 +299,7 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
             }
         }
 
+        /// Calls the configured server disconnect handler.
         fn callOnDisconnect(self: *Self, client_id: usize) Thread.SpawnError!void {
             if (self.options.on_disconnect) |on_disconnect| {
                 const thread = try Thread.spawn(.{}, callOnDisconnectInner, .{ S, R, C, on_disconnect, self.ctx, self, client_id });
@@ -248,6 +307,7 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
             }
         }
 
+        /// Performs a cryptographic key exchange with a connecting client.
         fn exchangeKeys(self: *Self, sock: Stream, address: Address) Error!void {
             try util.setBlocking(sock, true);
 
@@ -285,12 +345,14 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
             }
         }
 
+        /// A wrapper around `serve` that notes any error returned.
         fn runServe(self: *Self) void {
             self.serve() catch |err| {
                 self.serve_error = err;
             };
         }
 
+        /// Event loop for the server listener.
         fn serve(self: *Self) Error!void {
             while (true) {
                 switch (self.state) {
@@ -314,6 +376,7 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
             }
         }
 
+        /// Event loop for a single connected client.
         fn serveClient(self: *Self, client_id: usize) Error!void {
             try self.callOnConnect(client_id);
 
@@ -335,6 +398,7 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
             try self.callOnDisconnect(client_id);
         }
 
+        /// Handles a single message from a client.
         fn handleClientMessage(self: *Self, client_id: usize, client: ClientRepr) Error!bool {
             var size_buffer: [util.LENSIZE]u8 = undefined;
             const n1 = client.sock.readAll(&size_buffer) catch |err| {
