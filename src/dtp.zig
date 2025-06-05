@@ -933,6 +933,64 @@ test "stop server while client connected" {
     try expected.done();
 }
 
+// Called when data is received from a client
+fn exampleServerReceive(_: void, server: *Server(usize, []const u8, void), client_id: usize, data: Received([]const u8)) void {
+    defer data.deinit();
+    // Send back the length of the string
+    server.send(data.value.len, client_id) catch unreachable;
+}
+
+// Called when a client connects
+fn exampleServerConnect(_: void, _: *Server(usize, []const u8, void), client_id: usize) void {
+    std.debug.print("Client with ID {d} connected\n", .{client_id});
+}
+
+// Called when a client disconnects
+fn exampleServerDisconnect(_: void, server: *Server(usize, []const u8, void), client_id: usize) void {
+    std.debug.print("Client with ID {d} disconnected\n", .{client_id});
+    server.stop() catch unreachable;
+}
+
+const exampleMessage = "Hello, server!";
+
+// Called when data is received from the server
+fn exampleClientReceive(_: void, client: *Client([]const u8, usize, void), data: Received(usize)) void {
+    defer data.deinit();
+    // Validate the response
+    std.debug.print("Received response from server: {d}\n", .{data.value});
+    testing.expect(data.value == exampleMessage.len) catch unreachable;
+    client.disconnect() catch unreachable;
+}
+
+// Called when the client is disconnected from the server
+fn exampleClientDisconnected(_: void, _: *Client([]const u8, usize, void)) void {
+    std.debug.print("Unexpectedly disconnected from server\n", .{});
+}
+
 test "example" {
-    // TODO
+    var thread_safe_allocator = threadSafeAllocator();
+    const allocator = thread_safe_allocator.allocator();
+
+    // Create a server that receives strings and returns the length of each string
+    var server = Server(usize, []const u8, void).init(allocator, {}, .{
+        .on_receive = exampleServerReceive,
+        .on_connect = exampleServerConnect,
+        .on_disconnect = exampleServerDisconnect,
+    });
+    defer server.deinit();
+    try server.start("127.0.0.1", 29275);
+
+    // Create a client that sends a message to the server and receives the length of the message
+    var client = Client([]const u8, usize, void).init(allocator, {}, .{
+        .on_receive = exampleClientReceive,
+        .on_disconnected = exampleClientDisconnected,
+    });
+    defer client.deinit();
+    try client.connect("127.0.0.1", 29275);
+    try client.send(exampleMessage);
+
+    while (client.connected()) sleep();
+    while (server.serving()) sleep();
+
+    std.debug.print("Example finished\n", .{});
 }
