@@ -11,6 +11,7 @@ const AcceptError = Listener.AcceptError;
 const Address = net.Address;
 const Thread = std.Thread;
 const Received = util.Received;
+const AddressError = util.AddressError;
 
 /// A representation of a single connected client.
 const ClientRepr = struct {
@@ -79,7 +80,7 @@ fn callOnDisconnectInner(comptime S: type, comptime R: type, comptime C: type, o
 ///
 /// TODO: remove this once [this PR](https://github.com/ziglang/zig/pull/22555)
 /// is included in a major release.
-fn resolveIp(name: []const u8, port: u16) !Address {
+fn resolveIp(name: []const u8, port: u16) AddressError!Address {
     if (Address.parseIp4(name, port)) |ip4| return ip4 else |err| switch (err) {
         error.Overflow,
         error.InvalidEnd,
@@ -316,14 +317,14 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
 
             const secret_key = crypto.newKeyPair().secret_key;
 
-            const this_intermediate_shared_key = try crypto.dh1(public_key, secret_key);
+            const this_intermediate_shared_key = crypto.dh1(public_key, secret_key) catch return Error.KeyExchangeFailed;
             try sock.writeAll(&this_intermediate_shared_key);
 
             var other_intermediate_shared_key: [crypto.shared_length]u8 = undefined;
             const n = try sock.readAll(&other_intermediate_shared_key);
             if (n != other_intermediate_shared_key.len) return Error.KeyExchangeFailed;
 
-            const shared_key = try crypto.dh2(other_intermediate_shared_key, secret_key);
+            const shared_key = crypto.dh2(other_intermediate_shared_key, secret_key) catch return Error.KeyExchangeFailed;
 
             try util.setBlocking(sock, false);
 

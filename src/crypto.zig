@@ -1,14 +1,14 @@
 const std = @import("std");
-
 const Sha256 = std.crypto.hash.sha2.Sha256;
-
 const X25519 = std.crypto.dh.X25519;
+const Aes256 = std.crypto.core.aes.Aes256;
 const KeyPair = X25519.KeyPair;
+const IdentityElementError = std.crypto.errors.IdentityElementError;
+
 pub const public_length = X25519.public_length;
 pub const secret_length = X25519.secret_length;
 pub const shared_length = X25519.shared_length;
 
-const Aes256 = std.crypto.core.aes.Aes256;
 /// Length (in bytes) of an AES-256 key.
 pub const key_length = Aes256.key_bits / 8;
 
@@ -25,13 +25,13 @@ pub fn newKeyPair() KeyPair {
 }
 
 /// Performs the math for the first half of a Diffie-Hellman key exchange.
-pub fn dh1(public_key: [public_length]u8, secret_key: [secret_length]u8) ![shared_length]u8 {
+pub fn dh1(public_key: [public_length]u8, secret_key: [secret_length]u8) IdentityElementError![shared_length]u8 {
     return try X25519.scalarmult(secret_key, public_key);
 }
 
 /// Performs the math for the second half of a Diffie-Hellman key exchange,
 /// hashing the resulting shared key before returning it.
-pub fn dh2(intermediate_shared_key: [shared_length]u8, secret_key: [secret_length]u8) ![shared_length]u8 {
+pub fn dh2(intermediate_shared_key: [shared_length]u8, secret_key: [secret_length]u8) IdentityElementError![shared_length]u8 {
     const shared_key = try X25519.scalarmult(secret_key, intermediate_shared_key);
     return sha256(&shared_key);
 }
@@ -77,7 +77,7 @@ fn BlocksIterator(block_size: usize) type {
 
 /// Performs an AES encryption. This handles cases where the data is not a
 /// multiple of 16 bytes long.
-pub fn aesEncrypt(key: [key_length]u8, data: []const u8, writer: anytype) !void {
+pub fn aesEncrypt(key: [key_length]u8, data: []const u8, writer: anytype) @TypeOf(writer).Error!void {
     const last_block_len = if (data.len == 0) 0 else if (data.len % 16 == 0) 16 else @as(u8, @truncate(data.len % 16));
     try writer.writeByte(last_block_len);
 
@@ -97,7 +97,7 @@ pub fn aesEncrypt(key: [key_length]u8, data: []const u8, writer: anytype) !void 
 
 /// Performs an AES decryption. This handles cases where the data is not a
 /// multiple of 16 bytes long.
-pub fn aesDecrypt(key: [key_length]u8, data: []const u8, writer: anytype) !void {
+pub fn aesDecrypt(key: [key_length]u8, data: []const u8, writer: anytype) @TypeOf(writer).Error!void {
     const last_block_len = @as(usize, data[0]);
 
     var ctx = Aes256.initDec(key);

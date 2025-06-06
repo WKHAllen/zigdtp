@@ -23,6 +23,8 @@ const Thread = std.Thread;
 const Mutex = Thread.Mutex;
 const Random = std.Random;
 const Xoshiro256 = Random.Xoshiro256;
+const posix = std.posix;
+const GetRandomError = posix.GetRandomError;
 
 /// Default server host address.
 const SERVER_HOST = "127.0.0.1";
@@ -51,17 +53,17 @@ fn threadSafeAllocator() ThreadSafeAllocator {
 }
 
 /// Constructs a Xoshiro256 RNG instance.
-fn rngInstance() !Xoshiro256 {
+fn rngInstance() GetRandomError!Xoshiro256 {
     return std.Random.DefaultPrng.init(blk: {
         var seed: u64 = undefined;
-        try std.posix.getrandom(std.mem.asBytes(&seed));
+        try posix.getrandom(std.mem.asBytes(&seed));
         break :blk seed;
     });
 }
 
 /// Generates a random sequence of `n` bytes. The caller is responsible for
 /// calling `deinit` on the returned value.
-fn randomBytes(n: usize, rand: Random, allocator: Allocator) !ArrayList(u8) {
+fn randomBytes(n: usize, rand: Random, allocator: Allocator) Allocator.Error!ArrayList(u8) {
     var bytes = try ArrayList(u8).initCapacity(allocator, n);
     bytes.expandToCapacity();
     rand.bytes(bytes.items);
@@ -70,7 +72,7 @@ fn randomBytes(n: usize, rand: Random, allocator: Allocator) !ArrayList(u8) {
 
 /// Generates a sequence of random `u16` values. The caller is responsible for
 /// calling `deinit` on the returned value.
-fn randomMessages(min: usize, max: usize, rand: Random, allocator: Allocator) !ArrayList(u16) {
+fn randomMessages(min: usize, max: usize, rand: Random, allocator: Allocator) Allocator.Error!ArrayList(u16) {
     const n = rand.intRangeLessThan(usize, min, max);
     var messages = try ArrayList(u16).initCapacity(allocator, n);
     messages.expandToCapacity();
@@ -226,7 +228,7 @@ fn ExpectValue(comptime S: type, comptime C: type) type {
         client_disconnected,
 
         /// Display implementation.
-        pub fn format(self: Self, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+        pub fn format(self: Self, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) @TypeOf(writer).Error!void {
             try switch (self) {
                 .server_receive => |inner| writer.print(".server_receive({d}, {any})", .{ inner.@"0", inner.@"1" }),
                 .server_connect => |client_id| writer.print(".server_connect({d})", .{client_id}),
@@ -270,7 +272,7 @@ fn ExpectMap(comptime S: type, comptime C: type) type {
         }
 
         /// Notes that an event value is expected in this testing context.
-        pub fn expect(self: *Self, value: Value) !void {
+        pub fn expect(self: *Self, value: Value) Allocator.Error!void {
             self.mutex.lock();
             defer self.mutex.unlock();
 
@@ -279,7 +281,7 @@ fn ExpectMap(comptime S: type, comptime C: type) type {
 
         /// Notes that an event value has been received. This will panic if the
         /// received event was not expected.
-        pub fn received(self: *Self, value: Value) !void {
+        pub fn received(self: *Self, value: Value) void {
             self.mutex.lock();
             defer self.mutex.unlock();
 
@@ -292,7 +294,7 @@ fn ExpectMap(comptime S: type, comptime C: type) type {
 
         /// Checks that all expected events were received. This will panic if
         /// any events have yet to be encountered.
-        pub fn done(self: *Self) !void {
+        pub fn done(self: *Self) void {
             self.mutex.lock();
             defer self.mutex.unlock();
 
@@ -310,10 +312,7 @@ fn ExpectMap(comptime S: type, comptime C: type) type {
             return struct {
                 fn serverOnReceive(expected: *ExpectMap(S, C), _: *Server(C, S, *ExpectMap(S, C)), client_id: usize, data: Received(S)) void {
                     defer data.deinit();
-
-                    expected.received(.{ .server_receive = .{ client_id, data.value } }) catch |e| {
-                        std.debug.panic("{any}\n", .{e});
-                    };
+                    expected.received(.{ .server_receive = .{ client_id, data.value } });
                 }
             }.serverOnReceive;
         }
@@ -322,9 +321,7 @@ fn ExpectMap(comptime S: type, comptime C: type) type {
         pub fn ServerOnConnect() fn (*ExpectMap(S, C), *Server(C, S, *ExpectMap(S, C)), usize) void {
             return struct {
                 fn serverOnConnect(expected: *ExpectMap(S, C), _: *Server(C, S, *ExpectMap(S, C)), client_id: usize) void {
-                    expected.received(.{ .server_connect = client_id }) catch |e| {
-                        std.debug.panic("{any}\n", .{e});
-                    };
+                    expected.received(.{ .server_connect = client_id });
                 }
             }.serverOnConnect;
         }
@@ -333,9 +330,7 @@ fn ExpectMap(comptime S: type, comptime C: type) type {
         pub fn ServerOnDisconnect() fn (*ExpectMap(S, C), *Server(C, S, *ExpectMap(S, C)), usize) void {
             return struct {
                 fn serverOnDisonnect(expected: *ExpectMap(S, C), _: *Server(C, S, *ExpectMap(S, C)), client_id: usize) void {
-                    expected.received(.{ .server_disconnect = client_id }) catch |e| {
-                        std.debug.panic("{any}\n", .{e});
-                    };
+                    expected.received(.{ .server_disconnect = client_id });
                 }
             }.serverOnDisonnect;
         }
@@ -345,10 +340,7 @@ fn ExpectMap(comptime S: type, comptime C: type) type {
             return struct {
                 fn clientOnReceive(expected: *ExpectMap(S, C), _: *Client(S, C, *ExpectMap(S, C)), data: Received(C)) void {
                     defer data.deinit();
-
-                    expected.received(.{ .client_receive = data.value }) catch |e| {
-                        std.debug.panic("{any}\n", .{e});
-                    };
+                    expected.received(.{ .client_receive = data.value });
                 }
             }.clientOnReceive;
         }
@@ -357,9 +349,7 @@ fn ExpectMap(comptime S: type, comptime C: type) type {
         pub fn ClientOnDisconnected() fn (*ExpectMap(S, C), *Client(S, C, *ExpectMap(S, C))) void {
             return struct {
                 fn clientOnDisconnected(expected: *ExpectMap(S, C), _: *Client(S, C, *ExpectMap(S, C))) void {
-                    expected.received(.client_disconnected) catch |e| {
-                        std.debug.panic("{any}\n", .{e});
-                    };
+                    expected.received(.client_disconnected);
                 }
             }.clientOnDisconnected;
         }
@@ -372,9 +362,7 @@ fn ExpectMap(comptime S: type, comptime C: type) type {
 fn serverOnReceiveRespond(expected: *ExpectMap([]const u8, i32), server: *Server(i32, []const u8, *ExpectMap([]const u8, i32)), client_id: usize, data: Received([]const u8)) void {
     defer data.deinit();
 
-    expected.received(.{ .server_receive = .{ client_id, data.value } }) catch |e| {
-        std.debug.panic("{any}\n", .{e});
-    };
+    expected.received(.{ .server_receive = .{ client_id, data.value } });
 
     server.send(@intCast(data.value.len), client_id) catch |e| {
         std.debug.panic("{any}\n", .{e});
@@ -498,7 +486,7 @@ test "server serving" {
 
     try testing.expect(!server.serving());
 
-    try expected.done();
+    expected.done();
 }
 
 test "addresses" {
@@ -546,7 +534,7 @@ test "addresses" {
 
     try testing.expect(!server.serving());
 
-    try expected.done();
+    expected.done();
 }
 
 test "send" {
@@ -595,7 +583,7 @@ test "send" {
     try server.stop();
     sleep();
 
-    try expected.done();
+    expected.done();
 }
 
 test "large send" {
@@ -649,7 +637,7 @@ test "large send" {
     try server.stop();
     sleep();
 
-    try expected.done();
+    expected.done();
 }
 
 test "sending numerous messages" {
@@ -703,7 +691,7 @@ test "sending numerous messages" {
     try server.stop();
     sleep();
 
-    try expected.done();
+    expected.done();
 }
 
 test "sending custom types" {
@@ -766,7 +754,7 @@ test "sending custom types" {
     try server.stop();
     sleep();
 
-    try expected.done();
+    expected.done();
 }
 
 test "multiple clients" {
@@ -836,7 +824,7 @@ test "multiple clients" {
     try server.stop();
     sleep();
 
-    try expected.done();
+    expected.done();
 }
 
 test "remove client" {
@@ -885,7 +873,7 @@ test "remove client" {
 
     try testing.expect(!server.serving());
 
-    try expected.done();
+    expected.done();
 }
 
 test "stop server while client connected" {
@@ -930,7 +918,7 @@ test "stop server while client connected" {
     try testing.expect(!server.serving());
     try testing.expect(!client.connected());
 
-    try expected.done();
+    expected.done();
 }
 
 // Called when data is received from a client

@@ -194,14 +194,14 @@ pub fn Client(comptime S: type, comptime R: type, comptime C: type) type {
             const n1 = try sock.readAll(&public_key);
             if (n1 != public_key.len) return Error.KeyExchangeFailed;
 
-            const this_intermediate_shared_key = try crypto.dh1(public_key, secret_key);
+            const this_intermediate_shared_key = crypto.dh1(public_key, secret_key) catch return Error.KeyExchangeFailed;
             try sock.writeAll(&this_intermediate_shared_key);
 
             var other_intermediate_shared_key: [crypto.shared_length]u8 = undefined;
             const n2 = try sock.readAll(&other_intermediate_shared_key);
             if (n2 != other_intermediate_shared_key.len) return Error.KeyExchangeFailed;
 
-            const shared_key = try crypto.dh2(other_intermediate_shared_key, secret_key);
+            const shared_key = crypto.dh2(other_intermediate_shared_key, secret_key) catch return Error.KeyExchangeFailed;
 
             try util.setBlocking(sock, false);
 

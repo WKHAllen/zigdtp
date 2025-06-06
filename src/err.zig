@@ -16,4 +16,4 @@ pub const Error = error{
     KeyExchangeFailed,
     /// The socket failed to close.
     SocketCloseFailed,
-} || std.net.TcpConnectToHostError || std.Thread.SpawnError || std.io.AnyWriter.Error;
+} || std.posix.WriteError || std.net.TcpConnectToHostError || std.Thread.SpawnError || std.posix.FcntlError || std.json.ParseError(std.json.Scanner);
