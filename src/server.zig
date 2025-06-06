@@ -11,7 +11,6 @@ const AcceptError = Listener.AcceptError;
 const Address = net.Address;
 const Thread = std.Thread;
 const Received = util.Received;
-const AddressError = util.AddressError;
 
 /// A representation of a single connected client.
 const ClientRepr = struct {
@@ -76,24 +75,6 @@ fn callOnDisconnectInner(comptime S: type, comptime R: type, comptime C: type, o
     on_disconnect(ctx, server, client_id);
 }
 
-/// Resolves an IPv4 address.
-///
-/// TODO: remove this once [this PR](https://github.com/ziglang/zig/pull/22555)
-/// is included in a major release.
-fn resolveIp(name: []const u8, port: u16) AddressError!Address {
-    if (Address.parseIp4(name, port)) |ip4| return ip4 else |err| switch (err) {
-        error.Overflow,
-        error.InvalidEnd,
-        error.InvalidCharacter,
-        error.Incomplete,
-        error.NonCanonical,
-        => {},
-        else => return err,
-    }
-
-    return error.InvalidIPAddressFormat;
-}
-
 /// A network server.
 ///
 /// - `S` is the type that the server will send to clients.
@@ -147,7 +128,7 @@ pub fn Server(comptime S: type, comptime R: type, comptime C: type) type {
                 return Error.AlreadyServing;
             }
 
-            const address = try resolveIp(host, port);
+            const address = try util.resolveIp(host, port);
             try self.startViaAddress(address);
         }
 

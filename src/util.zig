@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Error = @import("err.zig").Error;
 const Allocator = std.mem.Allocator;
+const Address = std.net.Address;
 const Stream = std.net.Stream;
 const ParseError = std.json.ParseError;
 const Scanner = std.json.Scanner;
@@ -33,7 +34,7 @@ fn ErrorReturnedFrom(comptime f: anytype) type {
 
 /// Any error occurring when resolving an IP address. This is necessary because
 /// `std.net` doesn't export enough of its concrete error types.
-pub const AddressError = ErrorReturnedFrom(std.net.getAddressList);
+const AddressError = ErrorReturnedFrom(std.net.getAddressList);
 
 /// A value received through a network socket. `deinit` must be called once the
 /// memory is no longer needed.
@@ -77,6 +78,24 @@ pub fn decodeMessageSize(encoded_size: [LENSIZE]u8) usize {
     }
 
     return size;
+}
+
+/// Resolves an IPv4 address.
+///
+/// TODO: remove this once [this PR](https://github.com/ziglang/zig/pull/22555)
+/// is included in a major release.
+pub fn resolveIp(name: []const u8, port: u16) AddressError!Address {
+    if (Address.parseIp4(name, port)) |ip4| return ip4 else |err| switch (err) {
+        error.Overflow,
+        error.InvalidEnd,
+        error.InvalidCharacter,
+        error.Incomplete,
+        error.NonCanonical,
+        => {},
+        else => return err,
+    }
+
+    return error.InvalidIPAddressFormat;
 }
 
 /// Tries to close a socket, returning an error if the operation fails. This is

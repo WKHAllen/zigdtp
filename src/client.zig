@@ -5,7 +5,8 @@ const Error = @import("err.zig").Error;
 const Allocator = std.mem.Allocator;
 const net = std.net;
 const Stream = net.Stream;
-const ReadError = std.posix.ReadError;
+const posix = std.posix;
+const ReadError = posix.ReadError;
 const Address = net.Address;
 const Thread = std.Thread;
 const Received = util.Received;
@@ -164,6 +165,32 @@ pub fn Client(comptime S: type, comptime R: type, comptime C: type) type {
                 .not_connected => false,
                 .connected => |_| true,
             };
+        }
+
+        /// Returns the client's address.
+        pub fn getAddress(self: *Self) Error!Address {
+            switch (self.state) {
+                .not_connected => return Error.NotConnected,
+                .connected => |state| {
+                    var addr: posix.sockaddr align(4) = undefined;
+                    var addrlen: posix.socklen_t = @sizeOf(posix.sockaddr);
+                    try posix.getsockname(state.sock.handle, &addr, &addrlen);
+                    return Address.initPosix(&addr);
+                },
+            }
+        }
+
+        /// Returns the server's address.
+        pub fn getServerAddress(self: *Self) Error!Address {
+            switch (self.state) {
+                .not_connected => return Error.NotConnected,
+                .connected => |state| {
+                    var addr: posix.sockaddr align(4) = undefined;
+                    var addrlen: posix.socklen_t = @sizeOf(posix.sockaddr);
+                    try posix.getpeername(state.sock.handle, &addr, &addrlen);
+                    return Address.initPosix(&addr);
+                },
+            }
         }
 
         /// Calls the configured client receive handler.

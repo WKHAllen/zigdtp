@@ -473,6 +473,7 @@ test "server serving" {
         .on_connect = EM.ServerOnConnect(),
         .on_disconnect = EM.ServerOnDisconnect(),
     });
+    defer server.deinit();
     try testing.expect(!server.serving());
     try server.start(SERVER_HOST, SERVER_PORT);
     sleep();
@@ -499,13 +500,16 @@ test "addresses" {
     try expected.expect(.{ .server_connect = 0 });
     try expected.expect(.{ .server_disconnect = 0 });
 
+    const address = try util.resolveIp(SERVER_HOST, SERVER_PORT);
+
     var server = Server(i32, []const u8, *EM).init(allocator, &expected, .{
         .on_receive = EM.ServerOnReceive(),
         .on_connect = EM.ServerOnConnect(),
         .on_disconnect = EM.ServerOnDisconnect(),
     });
+    defer server.deinit();
     try testing.expect(!server.serving());
-    try server.start(SERVER_HOST, SERVER_PORT);
+    try server.startViaAddress(address);
     sleep();
 
     try testing.expect(server.serving());
@@ -516,13 +520,16 @@ test "addresses" {
         .on_receive = EM.ClientOnReceive(),
         .on_disconnected = EM.ClientOnDisconnected(),
     });
+    defer client.deinit();
     try testing.expect(!client.connected());
     try client.connect(SERVER_HOST, server_addr.getPort());
     sleep();
 
     try testing.expect(client.connected());
-    const client_addr = try server.getClientAddress(0);
+    const client_addr = try client.getAddress();
     std.debug.print("Client address: {}\n", .{client_addr});
+    try testing.expect((try server.getAddress()).eql(try client.getServerAddress()));
+    try testing.expect((try client.getAddress()).eql(try server.getClientAddress(0)));
 
     try client.disconnect();
     sleep();
@@ -557,6 +564,7 @@ test "send" {
         .on_connect = EM.ServerOnConnect(),
         .on_disconnect = EM.ServerOnDisconnect(),
     });
+    defer server.deinit();
     try server.start(SERVER_HOST, SERVER_PORT);
     sleep();
 
@@ -567,10 +575,11 @@ test "send" {
         .on_receive = EM.ClientOnReceive(),
         .on_disconnected = EM.ClientOnDisconnected(),
     });
+    defer client.deinit();
     try client.connectViaAddress(server_addr);
     sleep();
 
-    const client_addr = try server.getClientAddress(0);
+    const client_addr = try client.getAddress();
     std.debug.print("Client address: {}\n", .{client_addr});
 
     try server.sendAll(message_from_server);
@@ -611,6 +620,7 @@ test "large send" {
         .on_connect = EM.ServerOnConnect(),
         .on_disconnect = EM.ServerOnDisconnect(),
     });
+    defer server.deinit();
     try server.start(SERVER_HOST, SERVER_PORT);
     sleep();
 
@@ -621,10 +631,11 @@ test "large send" {
         .on_receive = EM.ClientOnReceive(),
         .on_disconnected = EM.ClientOnDisconnected(),
     });
+    defer client.deinit();
     try client.connectViaAddress(server_addr);
     sleep();
 
-    const client_addr = try server.getClientAddress(0);
+    const client_addr = try client.getAddress();
     std.debug.print("Client address: {}\n", .{client_addr});
 
     try server.sendAll(message_from_server.items);
@@ -665,6 +676,7 @@ test "sending numerous messages" {
         .on_connect = EM.ServerOnConnect(),
         .on_disconnect = EM.ServerOnDisconnect(),
     });
+    defer server.deinit();
     try server.start(SERVER_HOST, SERVER_PORT);
     sleep();
 
@@ -675,10 +687,11 @@ test "sending numerous messages" {
         .on_receive = EM.ClientOnReceive(),
         .on_disconnected = EM.ClientOnDisconnected(),
     });
+    defer client.deinit();
     try client.connectViaAddress(server_addr);
     sleep();
 
-    const client_addr = try server.getClientAddress(0);
+    const client_addr = try client.getAddress();
     std.debug.print("Client address: {}\n", .{client_addr});
 
     for (messages_from_server.items) |message| try server.sendAll(message);
@@ -728,6 +741,7 @@ test "sending custom types" {
         .on_connect = EM.ServerOnConnect(),
         .on_disconnect = EM.ServerOnDisconnect(),
     });
+    defer server.deinit();
     try server.start(SERVER_HOST, SERVER_PORT);
     sleep();
 
@@ -738,10 +752,11 @@ test "sending custom types" {
         .on_receive = EM.ClientOnReceive(),
         .on_disconnected = EM.ClientOnDisconnected(),
     });
+    defer client.deinit();
     try client.connectViaAddress(server_addr);
     sleep();
 
-    const client_addr = try server.getClientAddress(0);
+    const client_addr = try client.getAddress();
     std.debug.print("Client address: {}\n", .{client_addr});
 
     try server.sendAll(message_from_server);
@@ -784,6 +799,7 @@ test "multiple clients" {
         .on_connect = EM.ServerOnConnect(),
         .on_disconnect = EM.ServerOnDisconnect(),
     });
+    defer server.deinit();
     try server.start(SERVER_HOST, SERVER_PORT);
     sleep();
 
@@ -794,23 +810,29 @@ test "multiple clients" {
         .on_receive = EM.ClientOnReceive(),
         .on_disconnected = EM.ClientOnDisconnected(),
     });
+    defer client1.deinit();
     try client1.connectViaAddress(server_addr);
     sleep();
 
-    const client1_addr = try server.getClientAddress(0);
+    const client1_addr = try client1.getAddress();
     std.debug.print("Client 1 address: {}\n", .{client1_addr});
+    try testing.expect((try server.getAddress()).eql(try client1.getServerAddress()));
+    try testing.expect((try client1.getAddress()).eql(try server.getClientAddress(0)));
 
     var client2 = Client([]const u8, i32, *EM).init(allocator, &expected, .{
         .on_receive = EM.ClientOnReceive(),
         .on_disconnected = EM.ClientOnDisconnected(),
     });
+    defer client2.deinit();
     try client2.connectViaAddress(server_addr);
     sleep();
 
-    const client2_addr = try server.getClientAddress(1);
+    const client2_addr = try client2.getAddress();
     std.debug.print("Client 2 address: {}\n", .{client2_addr});
+    try testing.expect((try server.getAddress()).eql(try client2.getServerAddress()));
+    try testing.expect((try client2.getAddress()).eql(try server.getClientAddress(1)));
 
-    try server.sendAll(message_from_server);
+    try server.sendMultiple(message_from_server, &.{ 0, 1 });
     try client1.send(message_from_client1);
     try client2.send(message_from_client2);
     sleep();
@@ -843,6 +865,7 @@ test "remove client" {
         .on_connect = EM.ServerOnConnect(),
         .on_disconnect = EM.ServerOnDisconnect(),
     });
+    defer server.deinit();
     try testing.expect(!server.serving());
     try server.start(SERVER_HOST, SERVER_PORT);
     sleep();
@@ -855,12 +878,13 @@ test "remove client" {
         .on_receive = EM.ClientOnReceive(),
         .on_disconnected = EM.ClientOnDisconnected(),
     });
+    defer client.deinit();
     try testing.expect(!client.connected());
     try client.connect(SERVER_HOST, server_addr.getPort());
     sleep();
 
     try testing.expect(client.connected());
-    const client_addr = try server.getClientAddress(0);
+    const client_addr = try client.getAddress();
     std.debug.print("Client address: {}\n", .{client_addr});
 
     try server.removeClient(0);
@@ -892,6 +916,7 @@ test "stop server while client connected" {
         .on_connect = EM.ServerOnConnect(),
         .on_disconnect = EM.ServerOnDisconnect(),
     });
+    defer server.deinit();
     try testing.expect(!server.serving());
     try server.start(SERVER_HOST, SERVER_PORT);
     sleep();
@@ -904,12 +929,13 @@ test "stop server while client connected" {
         .on_receive = EM.ClientOnReceive(),
         .on_disconnected = EM.ClientOnDisconnected(),
     });
+    defer client.deinit();
     try testing.expect(!client.connected());
     try client.connect(SERVER_HOST, server_addr.getPort());
     sleep();
 
     try testing.expect(client.connected());
-    const client_addr = try server.getClientAddress(0);
+    const client_addr = try client.getAddress();
     std.debug.print("Client address: {}\n", .{client_addr});
 
     try server.stop();
